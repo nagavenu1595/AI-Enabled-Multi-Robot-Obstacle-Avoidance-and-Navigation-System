@@ -1,4 +1,4 @@
-**# AI-Driven Multi-Robot Obstacle & Collision Avoidance System
+**# AI-Driven Multi-Robot Obstacle & Collision Avoidance System**
 
 ## Project Overview
 A real-time, decentralized multi-robot navigation system where **8 autonomous robots** move safely in a shared grid environment. The system utilizes a dual-layer approach: a C++ PC-based simulation for logic verification and an embedded C++ implementation for ESP32 hardware execution.
@@ -60,4 +60,4 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 - **Priority Arbiter:** Resolves deadlocks when robots meet at intersections.
 - **Motor Control:** Closed-loop PWM regulation for straight-line driving and accurate 90° turns.
 
----**
+---
