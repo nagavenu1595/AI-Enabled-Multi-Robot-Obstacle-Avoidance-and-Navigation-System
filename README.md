@@ -1,4 +1,4 @@
-**# AI-Driven Multi-Robot Obstacle & Collision Avoidance System**
+**AI-Driven Multi-Robot Obstacle & Collision Avoidance System**
 
 ## Project Overview
 A real-time, decentralized multi-robot navigation system where **8 autonomous robots** move safely in a shared grid environment. The system utilizes a dual-layer approach: a C++ PC-based simulation for logic verification and an embedded C++ implementation for ESP32 hardware execution.
@@ -31,7 +31,7 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 
 ---
 
-## Hardware Components (Per Robot - Optimized for ₹10k Budget)
+## Hardware Components (Per Robot)
 - **Controller:** ESP32 Development Board (30-pin).
 - **Sensors:**
     - **HC-SR04 Ultrasonic:** Long-range obstacle detection.
