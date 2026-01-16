@@ -1,4 +1,4 @@
-**AI-Driven Multi-Robot Obstacle & Collision Avoidance System**
+# AI-Driven Multi-Robot Obstacle & Collision Avoidance System
 
 ## Project Overview
 A real-time, decentralized multi-robot navigation system where **8 autonomous robots** move safely in a shared grid environment. The system utilizes a dual-layer approach: a C++ PC-based simulation for logic verification and an embedded C++ implementation for ESP32 hardware execution.
@@ -33,12 +33,15 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 
 ## Hardware Components (Per Robot)
 - **Controller:** ESP32 Development Board (30-pin).
+- **Motor Driver:** **MX1508 Dual H-Bridge** (Handles high-current PWM for motors).
 - **Sensors:**
     - **HC-SR04 Ultrasonic:** Long-range obstacle detection.
     - **IR Sensors:** Short-range safety and DIY wheel encoding.
     - **MPU6050 IMU:** Heading and turn stability.
 - **Actuation:** 2x TT Gear Motors + 1x Caster Wheel (Differential Drive).
-- **Power:** 1x 18650 Li-ion Cell + TP4056 (Type-C Charger) + MT3608 (Boost Converter to 6V).
+- **Power System:** - 1x 18650 Li-ion Cell.
+    - **TP4056:** Type-C Charging/Protection module.
+    - **MT3608:** Boost Converter (Stepped up to 6V for motors).
 - **Chassis:** Lightweight Sunboard/PVC (Custom cut for agility).
 
 
@@ -57,7 +60,6 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 - **Odometry & State Estimation:** Tracking $(X, Y, \theta)$ using motor feedback.
 - **Neighbor Table Manager:** Real-time buffer for tracking the states of the other 7 robots.
 - **Pathfinder (A*):** Efficient grid-based route calculation.
-- **Priority Arbiter:** Resolves deadlocks when robots meet at intersections.
-- **Motor Control:** Closed-loop PWM regulation for straight-line driving and accurate 90° turns.
 
----
+- **Priority Arbiter:** Resolves deadlocks when robots meet at intersections using Robot ID hierarchy.
+- **Motor Control:** Closed-loop PWM regulation via the MX1508 for straight-line driving and accurate 90° turns.
