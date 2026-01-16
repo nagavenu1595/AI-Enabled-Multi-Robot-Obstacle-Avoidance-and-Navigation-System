@@ -49,7 +49,7 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 - **Embedded Language:** C++17 (Object-Oriented).
 - **Simulation:** C++/Raylib (For PC-based logic verification).
 - **Communication:** ESP-NOW (Low-latency peer-to-peer).
-- **IDE:** VS Code + PlatformIO.
+- **IDE:** VS Code + Arduino.
 
 ---
 
