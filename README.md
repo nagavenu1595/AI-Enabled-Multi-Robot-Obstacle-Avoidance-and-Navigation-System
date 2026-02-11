@@ -97,9 +97,10 @@ All robots move **step-by-step in sync**, meaning:
 - Cells marked **`0`** represent free space.
 - The pathfinding algorithm navigates only through free cells.
 
-#PENDING
--Improving software simulation
--Hardware simulation
+# PENDING
+- Improving software simulation  
+- Hardware simulation
+
 
 
 
