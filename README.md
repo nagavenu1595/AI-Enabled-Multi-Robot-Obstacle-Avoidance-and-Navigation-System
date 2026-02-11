@@ -63,3 +63,44 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 
 - **Priority Arbiter:** Resolves deadlocks when robots meet at intersections using Robot ID hierarchy.
 - **Motor Control:** Closed-loop PWM regulation via the MX1508 for straight-line driving and accurate 90° turns.
+
+
+# COMPLETED
+
+# Multi-Agent Path Finding (MAPF) Simulation
+
+This project implements **Time-Expanded A\*** to generate **collision-free paths** for multiple robots moving on a grid.
+
+---
+
+## 🚦 Collision Avoidance Features
+
+### 1. Vertex Collision
+No two robots are allowed to occupy the **same grid cell at the same timestep**.
+
+### 2. Edge Collision
+Robots are prevented from **swapping positions** in a single timestep (head-on collision prevention).
+
+### 3. Sequential Planning
+- Robots plan their paths one by one.
+- Each robot considers the **already planned paths** of previously planned robots.
+- Ensures cooperative, conflict-free movement.
+
+### 4. Synchronized Cycles
+All robots move **step-by-step in sync**, meaning:
+- Each robot completes the current movement step before the next step begins.
+
+---
+
+## 🧱 Obstacle Avoidance
+- Cells marked **`1`** represent obstacles.
+- Cells marked **`0`** represent free space.
+- The pathfinding algorithm navigates only through free cells.
+
+#PENDING
+-Improving software simulation
+-Hardware simulation
+
+
+
+
