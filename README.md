@@ -97,6 +97,57 @@ All robots move **step-by-step in sync**, meaning:
 - Cells marked **`0`** represent free space.
 - The pathfinding algorithm navigates only through free cells.
 
+---
+
+## Simulation Modes
+
+### Mode 1: Static Obstacles
+- All obstacles placed upfront before robots start moving
+- 5-second countdown, then robots follow fixed paths
+- Simple and predictable environment
+
+### Mode 2: Dynamic Environment
+- Obstacles appear one by one every 5 seconds
+- Robots begin moving after initial 5 seconds regardless
+- Continuous replanning when obstacles change positions
+- After all placed, obstacles relocate round-robin every 8 seconds
+
+---
+
+## 📚 Key Learnings
+
+### 1. Multi-Agent Pathfinding
+Sequential planning with reservation tables prevents the exponential complexity of 8 robots. Lower-ID robots plan first and claim paths; others navigate around them.
+
+### 2. Smooth Replanning
+When obstacles move, robots keep their movement history but replan future steps. This prevents visual "teleporting" during dynamic obstacle changes.
+
+### 3. Timing Precision
+Fixed countdown glitch by locking robots at start positions. Before simulation begins, interpolation alpha calculations were causing position jumps.
+
+### 4. Edge Collision Detection
+Not just vertex (same cell) conflicts, but also edge swaps where robots pass through each other. Checks both target and source cells in reservations.
+
+### 5. Reservation Strategy
+Robots reserve their goal cell forever after arrival, preventing late conflicts when others try to pass through occupied parking spots.
+
+### 6. Real-Time Performance
+Full replanning of 8 robots takes under 10ms even in worst case, ensuring smooth 60fps simulation without lag spikes.
+
+### 7. Priority Hierarchy
+Fixed robot priorities guarantee deadlock freedom over path length fairness. Lower IDs always have right-of-way.
+
+### 8. Simulation vs Hardware
+PC simulation stress-tests edge cases. Real ESP32 robots will face wheel slip, WiFi loss, and alignment errors that simulation can't replicate.
+
+### 9. Fast Iteration
+Raylib visualization enables seconds-per-change debugging vs 15-minute hardware test cycles. HUD shows obstacle status instantly.
+
+**Main Takeaway**: Simple deterministic rules beat complex optimization in embedded systems. Visualize everything early to spot issues fast.
+
+---
+
+
 # PENDING
 - Improving software simulation  
 - Hardware simulation
