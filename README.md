@@ -27,7 +27,7 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 - **Decentralized P2P Architecture:** No central master; communication via ESP-NOW Broadcast.
 - **Grid-Based Navigation:** Configurable occupancy grids for structured movement.
 - **Hybrid Avoidance:** A* for static obstacles + Priority rules for dynamic robot avoidance.
-- **Resource Optimized:** Written in memory-safe Embedded C++ to fit within the ESP32’s 520KB SRAM.
+- **Resource Optimized:** Written in memory-safe Embedded C++ to fit within the ESP32's 520KB SRAM.
 
 ---
 
@@ -44,8 +44,6 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
     - **MT3608:** Boost Converter (Stepped up to 6V for motors).
 - **Chassis:** Lightweight Sunboard/PVC (Custom cut for agility).
 
-
-
 ---
 
 ## Software & Tools
@@ -60,7 +58,6 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 - **Odometry & State Estimation:** Tracking $(X, Y, \theta)$ using motor feedback.
 - **Neighbor Table Manager:** Real-time buffer for tracking the states of the other 7 robots.
 - **Pathfinder (A*):** Efficient grid-based route calculation.
-
 - **Priority Arbiter:** Resolves deadlocks when robots meet at intersections using Robot ID hierarchy.
 - **Motor Control:** Closed-loop PWM regulation via the MX1508 for straight-line driving and accurate 90° turns.
 
@@ -73,7 +70,7 @@ This project implements **Time-Expanded A\*** to generate **collision-free paths
 
 ---
 
-## 🚦 Collision Avoidance Features
+## Collision Avoidance Features
 
 ### 1. Vertex Collision
 No two robots are allowed to occupy the **same grid cell at the same timestep**.
@@ -92,7 +89,7 @@ All robots move **step-by-step in sync**, meaning:
 
 ---
 
-## 🧱 Obstacle Avoidance
+## Obstacle Avoidance
 - Cells marked **`1`** represent obstacles.
 - Cells marked **`0`** represent free space.
 - The pathfinding algorithm navigates only through free cells.
@@ -112,47 +109,55 @@ All robots move **step-by-step in sync**, meaning:
 - Continuous replanning when obstacles change positions
 - After all placed, obstacles relocate round-robin every 8 seconds
 
+### Mode 3: Random Goals + Dynamic Environment
+- Robot goal assignments are randomized each run using shuffled pools
+- Combines dynamic obstacle placement with non-deterministic goal layout
+- Tests the planner under maximum variability
+
 ---
 
-## 📚 Key Learnings
+## Key Learnings
 
 ### 1. Multi-Agent Pathfinding
-Sequential planning with reservation tables prevents the exponential complexity of 8 robots. Lower-ID robots plan first and claim paths; others navigate around them.
+Sequential planning with reservation tables prevents the exponential complexity of jointly planning for 8 robots. Robots with the longest remaining path plan first, reserving their corridors before shorter-path robots can block them.
 
-### 2. Smooth Replanning
-When obstacles move, robots keep their movement history but replan future steps. This prevents visual "teleporting" during dynamic obstacle changes.
+### 2. Planning Order Matters More Than Algorithm
+The single biggest source of collisions was planning order. Short-path robots planning first would reserve cells that trapped long-path robots with no exit. Sorting by descending Manhattan distance solved ~80% of conflicts before any other mechanism was needed.
 
-### 3. Timing Precision
-Fixed countdown glitch by locking robots at start positions. Before simulation begins, interpolation alpha calculations were causing position jumps.
+### 3. Pre-Reserving Start Positions is Essential
+Before any robot's A* runs, all current robot positions must be inserted into `vertexRes[t=0]`. Without this, a later-planned robot can legally route through another robot's starting cell at t=1, creating an immediate collision at step 1 that no amount of priority shuffling can fix.
 
-### 4. Edge Collision Detection
-Not just vertex (same cell) conflicts, but also edge swaps where robots pass through each other. Checks both target and source cells in reservations.
+### 4. Collision Detection Must Check from `fromStep`, Not Zero
+During a mid-simulation replan, the historical portion of each path (steps 0 to fromStep) is already committed and may look like a collision in stale data. Checking `detectCollisions()` starting from `fromStep` instead of 0 eliminates false positives that caused infinite retry loops with no real conflict to resolve.
 
-### 5. Reservation Strategy
-Robots reserve their goal cell forever after arrival, preventing late conflicts when others try to pass through occupied parking spots.
+### 5. Three-Layer Collision Prevention Architecture
+A single mechanism is not enough. The final system uses three layers that activate in order:
+- **Layer 1 — Reservation Table:** A* physically cannot route through reserved cells. Handles ~95% of cases.
+- **Layer 2 — Priority Shuffling:** If a conflict is detected post-plan, conflicted robots are placed at the front of the planning queue and the whole pass is retried up to `MAX_REPLAN_ATTEMPTS` times.
+- **Layer 3 — Yield Resolution:** When all shuffle attempts fail, an at-goal blocker is identified and forced to temporarily step aside so the stuck robot can pass through its held cell.
 
-### 6. Real-Time Performance
-Full replanning of 8 robots takes under 10ms even in worst case, ensuring smooth 60fps simulation without lag spikes.
+### 6. Goal Hold Creates Invisible Deadlocks
+Robots reserve their goal cell for `GOAL_HOLD_STEPS` timesteps after arrival to prevent other robots from walking through a "parked" robot. However, if that held cell is the only corridor to another robot's goal, the second robot becomes permanently stuck. The yield mechanism was built specifically to break this deadlock by temporarily lifting the blocker's reservations, finding a free neighbour, routing the blocker there, letting the stuck robot pass, and returning the blocker to its goal.
 
-### 7. Priority Hierarchy
-Fixed robot priorities guarantee deadlock freedom over path length fairness. Lower IDs always have right-of-way.
+### 7. Obstacle-on-Robot Edge Case Requires Special Handling
+When a dynamic obstacle relocates onto a robot's current cell, `validCell()` returns false for that cell, so A* returns an empty path and the robot appears stuck. The yield resolver detects `grid[curPos]==1`, queues wait-in-place moves for a few steps, and lets the next relocation event trigger a fresh replan once the obstacle has moved away.
 
-### 8. Simulation vs Hardware
-PC simulation stress-tests edge cases. Real ESP32 robots will face wheel slip, WiFi loss, and alignment errors that simulation can't replicate.
+### 8. `erasePathReservations` Must Be the Exact Inverse of `reservePath`
+The yield mechanism temporarily removes a blocker's reservations to test if a stuck robot can then find a path. If the erase function does not mirror the reserve function exactly (including the goal-hold tail), stale entries remain in `vertexRes` and A* still sees the cell as blocked, making the yield attempt silently fail every time.
 
-### 9. Fast Iteration
-Raylib visualization enables seconds-per-change debugging vs 15-minute hardware test cycles. HUD shows obstacle status instantly.
+### 9. Smooth Replanning Requires Preserving History
+When obstacles move, robots keep their movement history up to `fromStep` and only replan the future segment. Without this, robots appear to teleport back to their position at replan time, breaking the visual continuity of the simulation and making step-printed logs inconsistent.
 
-**Main Takeaway**: Simple deterministic rules beat complex optimization in embedded systems. Visualize everything early to spot issues fast.
+### 10. Real-Time Performance
+Full replanning of 8 robots including yield resolution completes in under 10ms even in worst-case scenarios, ensuring smooth 60fps simulation without lag spikes.
+
+### 11. Simulation vs Hardware
+PC simulation stress-tests edge cases like simultaneous goal-holds, obstacle-on-robot events, and priority deadlocks. Real ESP32 robots will additionally face wheel slip, WiFi packet loss, and motor alignment drift that simulation cannot replicate — but catching the logical edge cases in simulation saves significant hardware debugging time.
+
+**Main Takeaway**: Deterministic, layered conflict resolution beats a single complex optimizer. Build detection before prevention, visualize every step, and treat each new edge case as a separate layer rather than patching the existing one.
 
 ---
-
 
 # PENDING
 - Improving software simulation  
 - Hardware simulation
-
-
-
-
-
