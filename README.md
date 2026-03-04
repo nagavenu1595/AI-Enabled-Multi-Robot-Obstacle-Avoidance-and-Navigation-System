@@ -39,7 +39,8 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
     - **IR Sensors:** Short-range safety and DIY wheel encoding.
     - **MPU6050 IMU:** Heading and turn stability.
 - **Actuation:** 2x TT Gear Motors + 1x Caster Wheel (Differential Drive).
-- **Power System:** - 1x 18650 Li-ion Cell.
+- **Power System:**
+    - 1x 18650 Li-ion Cell.
     - **TP4056:** Type-C Charging/Protection module.
     - **MT3608:** Boost Converter (Stepped up to 6V for motors).
 - **Chassis:** Lightweight Sunboard/PVC (Custom cut for agility).
@@ -105,10 +106,10 @@ All robots move **step-by-step in sync**, meaning:
 - Simple and predictable environment
 
 ### Mode 2: Dynamic Environment
-- Obstacles appear one by one every 5 seconds
+- Obstacles appear one by one every 12 seconds
 - Robots begin moving after initial 5 seconds regardless
 - Continuous replanning when obstacles change positions
-- After all placed, obstacles relocate round-robin every 8 seconds
+- After all placed, obstacles relocate round-robin every 10 seconds
 
 ### Mode 3: Random Goals + Dynamic Environment
 - Robot goal assignments are randomized each run using shuffled pools
@@ -117,77 +118,71 @@ All robots move **step-by-step in sync**, meaning:
 
 ---
 
+## Challenges Faced
+
+### 1. Vertex & Edge Collisions
+Two robots planning independently would target the same cell at the same timestep, or swap positions in a single step. Standard A* has no concept of either — separate vertex and edge reservation checks had to be explicitly added.
+
+### 2. Deadlocks
+Multiple robots would form a circular waiting pattern where each robot was blocked by the next and none could move. A cooperative yield mechanism was added where a goal-sitting robot temporarily steps aside to break the deadlock.
+
+### 3. Robot Teleportation
+During replanning, stitching the new path onto the old history caused positional discontinuities — robots would visually jump to a different cell instantly when the new segment's starting cell didn't match the robot's actual current position.
+
+### 4. Suboptimal Paths & Excessive Waiting
+Robots would sit idle instead of finding spatial detours. Introducing `WAIT_PENALTY` fixed this, but tuning it was tricky — too low and robots wait unnecessarily, too high and they take extremely long detours that cost more time overall.
+
+### 5. Replanning Cascade
+Replanning one robot after an obstacle change would shift its reservations, invalidating another robot's path, which when replanned invalidated yet another — creating a cascade that a single replan pass couldn't resolve. The system was extended to detect and replan all affected robots in one pass.
+
+### 6. Dynamic Obstacle Timer Bug
+When no free cell was found for obstacle placement, `lastObsTime` was never updated, causing the placement check to fire every frame and freeze the simulation under dense obstacle conditions.
+
+---
+
 # Key Learnings
 
 ### 1. Multi-Agent Pathfinding Requires Structured Planning
 Sequential planning with reservation tables prevents the exponential complexity of jointly planning paths for multiple robots. Each robot plans while considering already-reserved cells from earlier robots.
 
----
-
 ### 2. Planning Order Has Major Impact on Conflict Rates
 Robots with longer Manhattan distances plan first. This prevents short-path robots from blocking narrow corridors that longer paths depend on. Ordering by path difficulty significantly reduced collision scenarios.
-
----
 
 ### 3. Reservation Tables Are the Core of Conflict Prevention
 The reservation table tracks which robot occupies each cell at every timestep. A* is modified to reject any state that violates existing reservations, preventing vertex and edge collisions before they occur.
 
----
-
 ### 4. Early Collision Detection is Critical
 A full simulation validation pass is run after planning. If vertex or edge conflicts are detected, the planner retries with adjusted planning order or yield mechanisms before the simulation continues.
-
----
 
 ### 5. Dynamic Obstacles Require Mid-Execution Replanning
 When obstacles appear or relocate during execution, robots do not restart from scratch. Instead, the system preserves movement history up to the current timestep and replans only the remaining future path.
 
----
-
 ### 6. Replanning Must Consider All Affected Robots
 When the environment changes, replanning only a single robot can introduce cascading conflicts. The final system replans all robots whose future paths intersect with the changed region.
-
----
 
 ### 7. Goal Holding Prevents Robots Passing Through Parked Robots
 Once a robot reaches its goal, the goal cell remains reserved for several timesteps. This prevents other robots from passing through a robot that has stopped moving.
 
----
-
 ### 8. Yield Mechanisms Resolve Deadlocks
 In rare cases where reservations create blocking situations, a robot temporarily yields by moving to a neighbouring free cell. This allows blocked robots to pass before returning to its goal.
 
----
-
 ### 9. Dynamic Obstacle Edge Cases Must Be Handled Explicitly
-If an obstacle relocates onto a robot’s current cell, the robot temporarily waits and replans once the obstacle moves again. Without this handling, A* would fail because the current position would appear invalid.
-
----
+If an obstacle relocates onto a robot's current cell, the robot temporarily waits and replans once the obstacle moves again. Without this handling, A* would fail because the current position would appear invalid.
 
 ### 10. Corner Cells Should Be Reserved for Robot Navigation
 Obstacle placement in grid corners can create unavoidable deadlocks or block key entry/exit points for robots. Preventing obstacles from spawning in corner cells improves path availability and reduces artificial congestion.
 
----
-
 ### 11. Simulation is Essential for Discovering Hidden Edge Cases
-The PC-based simulator exposes situations difficult to detect on hardware, such as:
-- simultaneous replanning
-- multi-robot corridor conflicts
-- goal blocking
-- obstacle-on-robot scenarios
-
-Catching these in simulation prevents costly hardware debugging later.
-
----
+The PC-based simulator exposes situations difficult to detect on hardware, such as simultaneous replanning, multi-robot corridor conflicts, goal blocking, and obstacle-on-robot scenarios. Catching these in simulation prevents costly hardware debugging later.
 
 ### 12. Deterministic Layered Conflict Handling Works Best
 Rather than relying on a single complex algorithm, the final system combines multiple layers:
 
-1. Reservation-table path planning  
-2. Planning-order prioritization  
-3. Collision validation  
-4. Dynamic replanning  
-5. Yield resolution  
+1. Reservation-table path planning
+2. Planning-order prioritization
+3. Collision validation
+4. Dynamic replanning
+5. Yield resolution
 
 This layered approach produces robust behavior even in highly dynamic environments.
 
@@ -200,5 +195,5 @@ Reliable multi-robot coordination emerges from combining deterministic planning,
 ---
 
 # PENDING
-- Improving software simulation  
+- Improving software simulation
 - Hardware simulation
