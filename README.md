@@ -61,6 +61,7 @@ The project follows a **Decentralized Sense-Communicate-Plan-Act** cycle. Since 
 - **Priority Arbiter:** Resolves deadlocks when robots meet at intersections using Robot ID hierarchy.
 - **Motor Control:** Closed-loop PWM regulation via the MX1508 for straight-line driving and accurate 90° turns.
 
+---
 
 # COMPLETED
 
@@ -116,45 +117,85 @@ All robots move **step-by-step in sync**, meaning:
 
 ---
 
-## Key Learnings
+# Key Learnings
 
-### 1. Multi-Agent Pathfinding
-Sequential planning with reservation tables prevents the exponential complexity of jointly planning for 8 robots. Robots with the longest remaining path plan first, reserving their corridors before shorter-path robots can block them.
+### 1. Multi-Agent Pathfinding Requires Structured Planning
+Sequential planning with reservation tables prevents the exponential complexity of jointly planning paths for multiple robots. Each robot plans while considering already-reserved cells from earlier robots.
 
-### 2. Planning Order Matters More Than Algorithm
-The single biggest source of collisions was planning order. Short-path robots planning first would reserve cells that trapped long-path robots with no exit. Sorting by descending Manhattan distance solved ~80% of conflicts before any other mechanism was needed.
+---
 
-### 3. Pre-Reserving Start Positions is Essential
-Before any robot's A* runs, all current robot positions must be inserted into `vertexRes[t=0]`. Without this, a later-planned robot can legally route through another robot's starting cell at t=1, creating an immediate collision at step 1 that no amount of priority shuffling can fix.
+### 2. Planning Order Has Major Impact on Conflict Rates
+Robots with longer Manhattan distances plan first. This prevents short-path robots from blocking narrow corridors that longer paths depend on. Ordering by path difficulty significantly reduced collision scenarios.
 
-### 4. Collision Detection Must Check from `fromStep`, Not Zero
-During a mid-simulation replan, the historical portion of each path (steps 0 to fromStep) is already committed and may look like a collision in stale data. Checking `detectCollisions()` starting from `fromStep` instead of 0 eliminates false positives that caused infinite retry loops with no real conflict to resolve.
+---
 
-### 5. Three-Layer Collision Prevention Architecture
-A single mechanism is not enough. The final system uses three layers that activate in order:
-- **Layer 1 — Reservation Table:** A* physically cannot route through reserved cells. Handles ~95% of cases.
-- **Layer 2 — Priority Shuffling:** If a conflict is detected post-plan, conflicted robots are placed at the front of the planning queue and the whole pass is retried up to `MAX_REPLAN_ATTEMPTS` times.
-- **Layer 3 — Yield Resolution:** When all shuffle attempts fail, an at-goal blocker is identified and forced to temporarily step aside so the stuck robot can pass through its held cell.
+### 3. Reservation Tables Are the Core of Conflict Prevention
+The reservation table tracks which robot occupies each cell at every timestep. A* is modified to reject any state that violates existing reservations, preventing vertex and edge collisions before they occur.
 
-### 6. Goal Hold Creates Invisible Deadlocks
-Robots reserve their goal cell for `GOAL_HOLD_STEPS` timesteps after arrival to prevent other robots from walking through a "parked" robot. However, if that held cell is the only corridor to another robot's goal, the second robot becomes permanently stuck. The yield mechanism was built specifically to break this deadlock by temporarily lifting the blocker's reservations, finding a free neighbour, routing the blocker there, letting the stuck robot pass, and returning the blocker to its goal.
+---
 
-### 7. Obstacle-on-Robot Edge Case Requires Special Handling
-When a dynamic obstacle relocates onto a robot's current cell, `validCell()` returns false for that cell, so A* returns an empty path and the robot appears stuck. The yield resolver detects `grid[curPos]==1`, queues wait-in-place moves for a few steps, and lets the next relocation event trigger a fresh replan once the obstacle has moved away.
+### 4. Early Collision Detection is Critical
+A full simulation validation pass is run after planning. If vertex or edge conflicts are detected, the planner retries with adjusted planning order or yield mechanisms before the simulation continues.
 
-### 8. `erasePathReservations` Must Be the Exact Inverse of `reservePath`
-The yield mechanism temporarily removes a blocker's reservations to test if a stuck robot can then find a path. If the erase function does not mirror the reserve function exactly (including the goal-hold tail), stale entries remain in `vertexRes` and A* still sees the cell as blocked, making the yield attempt silently fail every time.
+---
 
-### 9. Smooth Replanning Requires Preserving History
-When obstacles move, robots keep their movement history up to `fromStep` and only replan the future segment. Without this, robots appear to teleport back to their position at replan time, breaking the visual continuity of the simulation and making step-printed logs inconsistent.
+### 5. Dynamic Obstacles Require Mid-Execution Replanning
+When obstacles appear or relocate during execution, robots do not restart from scratch. Instead, the system preserves movement history up to the current timestep and replans only the remaining future path.
 
-### 10. Real-Time Performance
-Full replanning of 8 robots including yield resolution completes in under 10ms even in worst-case scenarios, ensuring smooth 60fps simulation without lag spikes.
+---
 
-### 11. Simulation vs Hardware
-PC simulation stress-tests edge cases like simultaneous goal-holds, obstacle-on-robot events, and priority deadlocks. Real ESP32 robots will additionally face wheel slip, WiFi packet loss, and motor alignment drift that simulation cannot replicate — but catching the logical edge cases in simulation saves significant hardware debugging time.
+### 6. Replanning Must Consider All Affected Robots
+When the environment changes, replanning only a single robot can introduce cascading conflicts. The final system replans all robots whose future paths intersect with the changed region.
 
-**Main Takeaway**: Deterministic, layered conflict resolution beats a single complex optimizer. Build detection before prevention, visualize every step, and treat each new edge case as a separate layer rather than patching the existing one.
+---
+
+### 7. Goal Holding Prevents Robots Passing Through Parked Robots
+Once a robot reaches its goal, the goal cell remains reserved for several timesteps. This prevents other robots from passing through a robot that has stopped moving.
+
+---
+
+### 8. Yield Mechanisms Resolve Deadlocks
+In rare cases where reservations create blocking situations, a robot temporarily yields by moving to a neighbouring free cell. This allows blocked robots to pass before returning to its goal.
+
+---
+
+### 9. Dynamic Obstacle Edge Cases Must Be Handled Explicitly
+If an obstacle relocates onto a robot’s current cell, the robot temporarily waits and replans once the obstacle moves again. Without this handling, A* would fail because the current position would appear invalid.
+
+---
+
+### 10. Corner Cells Should Be Reserved for Robot Navigation
+Obstacle placement in grid corners can create unavoidable deadlocks or block key entry/exit points for robots. Preventing obstacles from spawning in corner cells improves path availability and reduces artificial congestion.
+
+---
+
+### 11. Simulation is Essential for Discovering Hidden Edge Cases
+The PC-based simulator exposes situations difficult to detect on hardware, such as:
+- simultaneous replanning
+- multi-robot corridor conflicts
+- goal blocking
+- obstacle-on-robot scenarios
+
+Catching these in simulation prevents costly hardware debugging later.
+
+---
+
+### 12. Deterministic Layered Conflict Handling Works Best
+Rather than relying on a single complex algorithm, the final system combines multiple layers:
+
+1. Reservation-table path planning  
+2. Planning-order prioritization  
+3. Collision validation  
+4. Dynamic replanning  
+5. Yield resolution  
+
+This layered approach produces robust behavior even in highly dynamic environments.
+
+---
+
+**Main Takeaway**
+
+Reliable multi-robot coordination emerges from combining deterministic planning, reservation-based conflict prevention, and responsive replanning. Visualization and simulation are invaluable tools for discovering edge cases before deploying algorithms to real hardware systems.
 
 ---
 
