@@ -14,7 +14,8 @@ const int GOAL_HOLD_STEPS     = 15;
 const int BACKTRACK_PENALTY   = 8;
 const int REVISIT_WINDOW      = 8;
 const int MAX_REPLAN_ATTEMPTS = 3;
-const int YIELD_WAIT_STEPS    = 4;
+const int YIELD_WAIT_STEPS    = 3;
+const int WAIT_PENALTY        = 50;
 
 map<int, set<pair<int,int>>>                         vertexRes;
 map<int, set<pair<pair<int,int>,pair<int,int>>>>     edgeRes;
@@ -78,14 +79,31 @@ static bool goalCanSettle(pair<int,int> cell,int fromT){
     return it->second < fromT;
 }
 
+pair<int,int> findSideStep(pair<int,int> pos, pair<int,int> goal, int atTime=1){
+    int gdx = goal.first  - pos.first;
+    int gdy = goal.second - pos.second;
+    vector<pair<int,int>> cands;
+    if(abs(gdx) >= abs(gdy)){
+        cands = {{pos.first,pos.second+1},{pos.first,pos.second-1},
+                 {pos.first+1,pos.second},{pos.first-1,pos.second}};
+    } else {
+        cands = {{pos.first+1,pos.second},{pos.first-1,pos.second},
+                 {pos.first,pos.second+1},{pos.first,pos.second-1}};
+    }
+    for(auto [nx,ny] : cands)
+        if(nx>=0 && ny>=0 && nx<ROWS && ny<COLS && validCell(nx,ny) && !vertexRes[atTime].count({nx,ny}))
+            return {nx,ny};
+    return pos;
+}
+
 string dirLabel(pair<int,int> f,pair<int,int> t){
     int dr=t.first-f.first,dc=t.second-f.second;
-    if(dr==0&&dc==0)  return "WAIT ";
+    if(dr==0&&dc==0)  return "HOLD ";
     if(dr==1&&dc==0)  return "DOWN ";
     if(dr==-1&&dc==0) return "UP   ";
     if(dr==0&&dc==1)  return "RIGHT";
     if(dr==0&&dc==-1) return "LEFT ";
-    return "DIAG_ERR";
+    return "DIAG?";
 }
 
 bool strictMoveOK(pair<int,int> from,pair<int,int> to){
@@ -104,7 +122,6 @@ CollisionReport detectCollisions(const vector<vector<pair<int,int>>>& paths,
     CollisionReport report;
     int maxLen = 0;
     for(auto& p : paths) maxLen = max(maxLen, (int)p.size());
-
     for(int t = fromStep; t < maxLen; t++) {
         map<pair<int,int>, vector<int>> cellOccupancy;
         for(int r = 0; r < ROBOTS; r++) {
@@ -144,7 +161,7 @@ CollisionReport detectCollisions(const vector<vector<pair<int,int>>>& paths,
     return report;
 }
 
-bool validatePath(int r,const vector<pair<int,int>>& path,int fromStep=0, bool verbose=true){
+bool validatePath(int r,const vector<pair<int,int>>& path,int fromStep=0,bool verbose=true){
     bool bad=false;
     for(int t=max(1,fromStep);t<(int)path.size();t++){
         int dr=abs(path[t].first-path[t-1].first);
@@ -158,7 +175,7 @@ bool validatePath(int r,const vector<pair<int,int>>& path,int fromStep=0, bool v
             bad=true;
         }
     }
-    if(!bad && verbose) printf(" %s OK (%d steps)\n",ROBOT_NAMES[r],(int)path.size());
+    if(!bad&&verbose) printf(" %s OK (%d steps)\n",ROBOT_NAMES[r],(int)path.size());
     return !bad;
 }
 
@@ -174,20 +191,28 @@ void printSingleStep(int step,
         bool atGoal     =(cur==goals[r]);
         bool illegalMove=!strictMoveOK(cur,nxt);
         bool trulyStuck =((int)paths[r].size()<=1&&!atGoal);
-        bool plannedWait=(cur==nxt&&!atGoal&&!trulyStuck);
-        printf(" %-14s (%d,%d)->(%d,%d) [%s]%s%s%s%s\n",
+        bool forcedWait =(cur==nxt && !atGoal);
+        int distCur = abs(cur.first-goals[r].first)+abs(cur.second-goals[r].second);
+        int distNxt = abs(nxt.first-goals[r].first)+abs(nxt.second-goals[r].second);
+        bool isSlow  = (!atGoal && cur!=nxt && distNxt >= distCur);
+        bool wasAtGoal = (step>0 &&
+                          paths[r][min(step-1,(int)paths[r].size()-1)]==goals[r]);
+        bool isYielding = (!atGoal && wasAtGoal);
+        printf(" %-14s (%d,%d)->(%d,%d) [%s]%s%s%s%s%s%s\n",
                ROBOT_NAMES[r],
                cur.first,cur.second,nxt.first,nxt.second,
                dirLabel(cur,nxt).c_str(),
                atGoal      ?" GOAL!":"",
+               isYielding  ?" YIELDING":"",
+               isSlow      ?" SLOW":"",
                trulyStuck  ?" STUCK":"",
-               plannedWait ?" wait":"",
+               forcedWait  ?" FORCED-WAIT":"",
                illegalMove ?" ILLEGAL!":"");
     }
 }
 
 vector<pair<int,int>> timeExpandedAStar(pair<int,int> s,pair<int,int> g,
-                                         bool startOnObs=false)
+                                         bool startOnObs=false, int localMaxTime = MAX_TIME)
 {
     vector<Node*> pool;
     auto makeNode=[&](int x,int y,int t,int gc,int h,Node* par)->Node*{
@@ -215,18 +240,17 @@ vector<pair<int,int>> timeExpandedAStar(pair<int,int> s,pair<int,int> g,
             result=reconstruct(cur);
             break;
         }
-        if(cur->t>=MAX_TIME) continue;
+        if(cur->t>=localMaxTime) continue;
 
         for(auto[dx,dy]:vector<pair<int,int>>{{0,0},{1,0},{-1,0},{0,1},{0,-1}}){
             int nx=cur->x+dx, ny=cur->y+dy, nt=cur->t+1;
-            bool waitOnBlockedStart=(dx==0&&dy==0&&cur->t==0
-                                     &&startOnObs&&nx==s.first&&ny==s.second);
-            if(!waitOnBlockedStart&&!validCell(nx,ny)) continue;
+            if(nx<0||ny<0||nx>=ROWS||ny>=COLS) continue;
+            if(grid[nx][ny]!=0) continue;
             if(vertexRes[nt].count({nx,ny})) continue;
-            if(edgeRes[nt].count({{nx,ny},{cur->x,cur->y}})) continue;
-
-            bool revisit=(dx!=0||dy!=0)&&recentlyVisited(cur,nx,ny);
-            int  extra_g=revisit?BACKTRACK_PENALTY:0;
+            bool isWait=(dx==0&&dy==0);
+            if(!isWait && edgeRes[nt].count({{nx,ny},{cur->x,cur->y}})) continue;
+            bool revisit=(!isWait)&&recentlyVisited(cur,nx,ny);
+            int extra_g=isWait?WAIT_PENALTY:(revisit?BACKTRACK_PENALTY:0);
             pq.push(makeNode(nx,ny,nt,
                              cur->g+1+extra_g,
                              heuristic(nx,ny,g.first,g.second),
@@ -293,7 +317,8 @@ vector<int> planningOrder(const vector<pair<int,int>>& pos,
     }
     sort(di.begin(),di.end(),[](auto&a,auto&b){
         if(get<0>(a)!=get<0>(b)) return get<0>(a)>get<0>(b);
-        return get<1>(a)<get<1>(b);
+        if(get<1>(a)!=get<1>(b)) return get<1>(a)<get<1>(b);
+        return get<2>(a)<get<2>(b);
     });
     vector<int> o=overrideList;
     for(auto&[d,g,r]:di) o.push_back(r);
@@ -322,17 +347,18 @@ void resolveYield(int fromStep,
 
         if(grid[curPos[stuckR].first][curPos[stuckR].second]==1){
             if(verbose)
-                printf(" [YIELD] %s is ON an obstacle at (%d,%d) — waiting for reloc\n",
+                printf(" [YIELD] %s ON obstacle (%d,%d) — side-stepping\n",
                        ROBOT_NAMES[stuckR],curPos[stuckR].first,curPos[stuckR].second);
             newSegs[stuckR]={curPos[stuckR]};
-            for(int i=0;i<YIELD_WAIT_STEPS+2;i++)
-                newSegs[stuckR].push_back(curPos[stuckR]);
+            auto ss=findSideStep(curPos[stuckR],goals[stuckR],1);
+            for(int i=0;i<YIELD_WAIT_STEPS;i++)
+                newSegs[stuckR].push_back(ss);
             reservePath(newSegs[stuckR]);
             continue;
         }
 
         if(verbose)
-            printf(" [YIELD] %s stuck at (%d,%d) — scanning for goal-blocker...\n",
+            printf(" [YIELD] %s stuck at (%d,%d) — scanning blocker...\n",
                    ROBOT_NAMES[stuckR],curPos[stuckR].first,curPos[stuckR].second);
 
         bool resolved=false;
@@ -342,51 +368,41 @@ void resolveYield(int fromStep,
             if(curPos[blocker]!=goals[blocker]) continue;
 
             erasePathReservations(newSegs[blocker]);
-
             auto testPath=timeExpandedAStar(curPos[stuckR],goals[stuckR],false);
-
-            if((int)testPath.size()<=1){
-                reservePath(newSegs[blocker]);
-                continue;
-            }
+            if((int)testPath.size()<=1){ reservePath(newSegs[blocker]); continue; }
 
             pair<int,int> yieldCell={-1,-1};
             for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
                 int nx=goals[blocker].first+dx, ny=goals[blocker].second+dy;
-                if(!validCell(nx,ny)) continue;
-                if(vertexRes[1].count({nx,ny})) continue;
-                yieldCell={nx,ny};
-                break;
+                if(!validCell(nx,ny)||vertexRes[1].count({nx,ny})) continue;
+                yieldCell={nx,ny}; break;
             }
-
             if(yieldCell.first==-1){
-                if(verbose)
-                    printf(" [YIELD]  %s has no free neighbour\n",ROBOT_NAMES[blocker]);
-                reservePath(newSegs[blocker]);
-                continue;
+                if(verbose) printf(" [YIELD] %s has no free neighbour\n",ROBOT_NAMES[blocker]);
+                reservePath(newSegs[blocker]); continue;
             }
 
             if(verbose)
-                printf(" [YIELD]  %s steps to (%d,%d) to let %s through\n",
+                printf(" [YIELD] %s steps to (%d,%d) for %s\n",
                        ROBOT_NAMES[blocker],yieldCell.first,yieldCell.second,
                        ROBOT_NAMES[stuckR]);
 
+            int dist=abs(curPos[stuckR].first-goals[blocker].first)
+                    +abs(curPos[stuckR].second-goals[blocker].second);
+            int window = max(1, min(3, dist)); 
             vector<pair<int,int>> yieldPath;
             yieldPath.push_back(goals[blocker]);
-            yieldPath.push_back(yieldCell);
-            for(int i=0;i<YIELD_WAIT_STEPS;i++)
-                yieldPath.push_back(yieldCell);
+            for(int i=0;i<window;i++) yieldPath.push_back(yieldCell);
             yieldPath.push_back(goals[blocker]);
 
             newSegs[blocker]=yieldPath;
             reservePath(yieldPath);
 
             newSegs[stuckR]=timeExpandedAStar(curPos[stuckR],goals[stuckR],false);
-
             if((int)newSegs[stuckR].size()>1){
                 reservePath(newSegs[stuckR]);
                 if(verbose)
-                    printf(" [YIELD]  %s found path (%d steps)\n",
+                    printf(" [YIELD] %s found path (%d steps)\n",
                            ROBOT_NAMES[stuckR],(int)newSegs[stuckR].size());
                 resolved=true;
             } else {
@@ -394,18 +410,18 @@ void resolveYield(int fromStep,
                 newSegs[blocker]={goals[blocker]};
                 reservePath(newSegs[blocker]);
                 if(verbose)
-                    printf(" [YIELD]  Still stuck after %s yielded — reverting\n",
+                    printf(" [YIELD] Still stuck after %s yielded — reverting\n",
                            ROBOT_NAMES[blocker]);
             }
         }
 
         if(!resolved){
             if(verbose)
-                printf(" [YIELD] %s: no blocker found — waiting in place\n",
+                printf(" [YIELD] %s: no blocker — side-stepping\n",
                        ROBOT_NAMES[stuckR]);
             newSegs[stuckR]={curPos[stuckR]};
-            for(int i=0;i<YIELD_WAIT_STEPS;i++)
-                newSegs[stuckR].push_back(curPos[stuckR]);
+            auto ss=findSideStep(curPos[stuckR],goals[stuckR],1);
+            for(int i=0;i<2;i++) newSegs[stuckR].push_back(ss);
             reservePath(newSegs[stuckR]);
         }
     }
@@ -419,20 +435,49 @@ void replanAll(int fromStep,const vector<pair<int,int>>& goals,
         if(verbose) printf(" [REPLAN SKIPPED] All at goals\n");
         return;
     }
-    if(verbose){
-        printf("\n=== REPLAN at step %d ===\n",fromStep);
-        for(int r=0;r<ROBOTS;r++){
-            int cs=min(fromStep,(int)paths[r].size()-1);
-            auto p=paths[r][cs];
-            printf(" %s : (%d,%d)%s\n",ROBOT_NAMES[r],p.first,p.second,
-                   grid[p.first][p.second]?" [ON OBSTACLE!]":"");
-        }
-    }
+
+    vector<vector<pair<int,int>>> originalPaths = paths;
 
     vector<pair<int,int>> curPos(ROBOTS);
     for(int r=0;r<ROBOTS;r++){
         int cs=min(fromStep,(int)paths[r].size()-1);
         curPos[r]=paths[r][cs];
+    }
+
+    vector<bool> needsRepath(ROBOTS, false);
+    int affectedCount = 0;
+    for(int r=0;r<ROBOTS;r++){
+        if(curPos[r]==goals[r]) continue;
+        for(int t=fromStep;t<(int)paths[r].size();t++){
+            auto cell = paths[r][t];
+            if(grid[cell.first][cell.second]!=0){
+                needsRepath[r]=true;
+                affectedCount++;
+                break;
+            }
+            if(vertexRes.count(t) && vertexRes[t].count(cell)){
+                needsRepath[r]=true;
+                affectedCount++;
+                break;
+            }
+        }
+    }
+    if(affectedCount==0){
+        if(verbose) printf(" [REPLAN SKIPPED] No robot path blocked by obstacle (time-aware)\n");
+        return;
+    }
+
+    if(verbose){
+        printf("\n=== REPLAN at step %d ===\n",fromStep);
+        for(int r=0;r<ROBOTS;r++){
+            int cs=min(fromStep,(int)paths[r].size()-1);
+            auto p=paths[r][cs];
+            const char* tag = (curPos[r]==goals[r]) ? " [AT GOAL]"
+                            : needsRepath[r]         ? " [REPLANNING]"
+                            :                          " [KEPT PATH]";
+            printf(" %s : (%d,%d)%s%s\n",ROBOT_NAMES[r],p.first,p.second,
+                   grid[p.first][p.second]?" [ON OBSTACLE!]":"", tag);
+        }
     }
 
     auto assemblePaths=[&](const vector<vector<pair<int,int>>>& segs)
@@ -447,8 +492,67 @@ void replanAll(int fromStep,const vector<pair<int,int>>& goals,
         }
         int len=0;
         for(auto&p:cand) len=max(len,(int)p.size());
-        for(auto&p:cand) while((int)p.size()<len) p.push_back(p.back());
+        for(int r=0;r<ROBOTS;r++){
+            while((int)cand[r].size()<len){
+                auto last=cand[r].back();
+                if(last==goals[r]){ cand[r].push_back(last); continue; }
+                if((int)cand[r].size()>=2){
+                    auto prev=cand[r][cand[r].size()-2];
+                    if(prev!=last&&validCell(prev.first,prev.second)){
+                        cand[r].push_back(prev); continue;
+                    }
+                }
+                auto ss=findSideStep(last,goals[r],(int)cand[r].size()%MAX_TIME);
+                cand[r].push_back(ss);
+            }
+        }
         return cand;
+    };
+
+    auto buildYieldPath=[&](pair<int,int> goalCell,pair<int,int> yieldCell,
+                             int stuckDist) -> vector<pair<int,int>> {
+        int window = max(1, min(3, stuckDist));
+        vector<pair<int,int>> yp;
+        yp.push_back(goalCell);
+        for(int i=0;i<window;i++) yp.push_back(yieldCell);
+        yp.push_back(goalCell);
+        return yp;
+    };
+
+    auto tryCoopYield=[&](int r,bool onObs,
+                          vector<vector<pair<int,int>>>& segs,
+                          bool loud) -> bool {
+        for(int blocker=0; blocker<ROBOTS; blocker++){
+            if(blocker==r) continue;
+            if(segs[blocker].empty()) continue;
+            if(curPos[blocker]!=goals[blocker]) continue;
+            erasePathReservations(segs[blocker]);
+            auto testPath=timeExpandedAStar(curPos[r],goals[r],onObs);
+            if((int)testPath.size()<=1){ reservePath(segs[blocker]); continue; }
+            pair<int,int> yieldCell={-1,-1};
+            for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
+                int nx=goals[blocker].first+dx, ny=goals[blocker].second+dy;
+                if(!validCell(nx,ny)||vertexRes[1].count({nx,ny})) continue;
+                yieldCell={nx,ny}; break;
+            }
+            if(yieldCell.first==-1){ reservePath(segs[blocker]); continue; }
+            int dist=abs(curPos[r].first-goals[blocker].first)
+                    +abs(curPos[r].second-goals[blocker].second);
+            auto yp=buildYieldPath(goals[blocker],yieldCell,dist);
+            segs[blocker]=yp;
+            reservePath(yp);
+            segs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
+            if((int)segs[r].size()>1){
+                if(loud) printf(" [COOP-YIELD] %s steps aside (%d steps) for %s\n",
+                               ROBOT_NAMES[blocker],(int)yp.size()-2,ROBOT_NAMES[r]);
+                return true;
+            }
+            erasePathReservations(yp);
+            segs[blocker]={goals[blocker]};
+            reservePath(segs[blocker]);
+            segs[r]={curPos[r]};
+        }
+        return false;
     };
 
     set<int> conflictedRobots;
@@ -456,43 +560,66 @@ void replanAll(int fromStep,const vector<pair<int,int>>& goals,
 
     for(int attempt=0; attempt<MAX_REPLAN_ATTEMPTS; attempt++){
         vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
-
         for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(curPos[r]);
         rebuildCellLastReserved();
 
         vector<int> order;
         if(attempt==0){
-            order=planningOrder(curPos,goals);
+            set<int> affSet;
+            for(int r=0;r<ROBOTS;r++) if(needsRepath[r]) affSet.insert(r);
+            order=planningOrder(curPos,goals,affSet);
         } else {
-            vector<int> cv(conflictedRobots.begin(),conflictedRobots.end());
+            set<int> retrySet;
+            for(int r:conflictedRobots) if(needsRepath[r]) retrySet.insert(r);
+            vector<int> cv(retrySet.begin(),retrySet.end());
             unsigned seed=(unsigned)(time(0)+attempt*999983);
             shuffle(cv.begin(),cv.end(),default_random_engine(seed));
-            set<int> cs(conflictedRobots.begin(),conflictedRobots.end());
+            set<int> cs(retrySet.begin(),retrySet.end());
             vector<int> rest=planningOrder(curPos,goals,cs);
             order=cv;
             for(int r:rest) order.push_back(r);
         }
 
         if(verbose&&attempt==0){
-            printf(" Order: ");
-            for(int r:order) printf("%s ",ROBOT_NAMES[r]);
+            printf(" Order (affected): ");
+            for(int r:order) if(needsRepath[r]) printf("%s ",ROBOT_NAMES[r]);
             printf("\n");
         }
 
         vector<vector<pair<int,int>>> newSegs(ROBOTS);
-        for(int r:order){
-            bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
-            bool atGoal=(curPos[r]==goals[r]);
-            if(atGoal){
+
+        for(int r=0;r<ROBOTS;r++){
+            if(curPos[r]==goals[r]){
                 newSegs[r]={curPos[r]};
-            } else {
-                newSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
-                if((int)newSegs[r].size()<=1&&!atGoal){
+                reservePath(newSegs[r]);
+            }
+        }
+
+        for(int r=0;r<ROBOTS;r++){
+            if(curPos[r]==goals[r]) continue;
+            if(!needsRepath[r]){
+                newSegs[r].clear();
+                for(int t=fromStep;t<(int)paths[r].size();t++)
+                    newSegs[r].push_back(paths[r][t]);
+                reservePath(newSegs[r]);
+            }
+        }
+
+        for(int r:order){
+            if(curPos[r]==goals[r]) continue;
+            if(!needsRepath[r]) continue;
+
+            bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
+            newSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
+
+            if((int)newSegs[r].size()<=1){
+                bool ok=tryCoopYield(r,onObs,newSegs,verbose&&attempt==0);
+                if(!ok){
                     if(verbose&&attempt==0)
-                        printf(" [STUCK L1] %s at (%d,%d)\n",
+                        printf(" [STUCK L1] %s at (%d,%d) — no path found\n",
                                ROBOT_NAMES[r],curPos[r].first,curPos[r].second);
                     newSegs[r]={curPos[r]};
-                    for(int i=0;i<5;i++) newSegs[r].push_back(curPos[r]);
+                    for(int i=0;i<3;i++) newSegs[r].push_back(curPos[r]);
                 }
             }
             reservePath(newSegs[r]);
@@ -513,7 +640,10 @@ void replanAll(int fromStep,const vector<pair<int,int>>& goals,
             return;
         }
 
-        for(int r:cr.affectedRobots) conflictedRobots.insert(r);
+        for(int r:cr.affectedRobots){
+            conflictedRobots.insert(r);
+            needsRepath[r] = true;
+        }
         if(verbose)
             printf(" [attempt %d/%d] %s — retrying...\n",
                    attempt+1,MAX_REPLAN_ATTEMPTS,cr.description.c_str());
@@ -531,15 +661,33 @@ void replanAll(int fromStep,const vector<pair<int,int>>& goals,
     vector<int> finalOrder=planningOrder(curPos,goals);
     vector<vector<pair<int,int>>> finalSegs(ROBOTS);
 
-    for(int r:finalOrder){
-        bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
-        bool atGoal=(curPos[r]==goals[r]);
-        if(atGoal){
+    for(int r=0;r<ROBOTS;r++){
+        if(curPos[r]==goals[r]){
             finalSegs[r]={curPos[r]};
-        } else {
-            finalSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
-            if((int)finalSegs[r].size()<=1&&!atGoal)
+            reservePath(finalSegs[r]);
+        }
+    }
+
+    for(int r=0;r<ROBOTS;r++){
+        if(curPos[r]==goals[r]) continue;
+        if(!needsRepath[r]) continue;
+        finalSegs[r].clear();
+        for(int t=fromStep;t<(int)paths[r].size();t++)
+            finalSegs[r].push_back(paths[r][t]);
+        reservePath(finalSegs[r]);
+    }
+
+    for(int r:finalOrder){
+        if(curPos[r]==goals[r]) continue;
+        if(!needsRepath[r]) continue;
+        bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
+        finalSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
+        if((int)finalSegs[r].size()<=1){
+            bool ok=tryCoopYield(r,onObs,finalSegs,verbose);
+            if(!ok){
                 finalSegs[r]={curPos[r]};
+                for(int i=0;i<3;i++) finalSegs[r].push_back(curPos[r]);
+            }
         }
         reservePath(finalSegs[r]);
     }
@@ -549,20 +697,85 @@ void replanAll(int fromStep,const vector<pair<int,int>>& goals,
     auto finalCand=assemblePaths(finalSegs);
     auto finalCr=detectCollisions(finalCand,fromStep,false);
 
-    paths=finalCand;
-    maxLen=(int)finalCand[0].size();
-
-    if(verbose){
-        if(!finalCr.hasCollision){
+    if(!finalCr.hasCollision){
+        paths=finalCand;
+        maxLen=(int)finalCand[0].size();
+        if(verbose){
             printf(" Validation:\n");
             for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],fromStep,verbose);
             printf(" COLLISION-FREE (after yield pass)\n");
-        } else {
-            printf(" [WARNING] Residual collision after yield: %s\n",
-                   finalCr.description.c_str());
+            printf(" maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
         }
-        printf(" maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
+        return;
     }
+
+    if(verbose){
+        printf(" [WARNING] Residual collision after yield: %s\n",
+               finalCr.description.c_str());
+        printf(" Attempting full replan with extended horizon...\n");
+    }
+
+    int extendedHorizon = min(MAX_TIME*2, MAX_TIME + 100);
+
+    vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+    for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(curPos[r]);
+    rebuildCellLastReserved();
+
+    vector<vector<pair<int,int>>> fullSegs(ROBOTS);
+    vector<int> fullOrder = planningOrder(curPos,goals);
+
+    for(int r=0;r<ROBOTS;r++){
+        bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
+        fullSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs,extendedHorizon);
+        if((int)fullSegs[r].size()<=1){
+            fullSegs[r]={curPos[r]};
+            for(int i=0;i<3;i++) fullSegs[r].push_back(curPos[r]);
+        }
+        reservePath(fullSegs[r]);
+    }
+
+    auto fullCand=assemblePaths(fullSegs);
+    auto fullCr=detectCollisions(fullCand,fromStep,false);
+
+    if(!fullCr.hasCollision){
+        paths=fullCand;
+        maxLen=(int)fullCand[0].size();
+        if(verbose){
+            printf(" Validation:\n");
+            for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],fromStep,verbose);
+            printf(" COLLISION-FREE (after full replan)\n");
+            printf(" maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
+        }
+        return;
+    }
+
+    if(verbose){
+        printf(" [REPLAN FAILED] full replan still colliding: %s\n", fullCr.description.c_str());
+        printf(" Reverting to previous plan where possible.\n");
+    }
+
+    auto bestCand = assemblePaths(bestSegs);
+    auto bestCr = detectCollisions(bestCand,fromStep,false);
+    if(!bestSegs.empty() && !bestCr.hasCollision){
+        paths = bestCand;
+        maxLen=(int)bestCand[0].size();
+        if(verbose){
+            printf(" Recovered using best candidate (collision-free)\n");
+        }
+        return;
+    }
+
+    if(!originalPaths.empty()){
+        auto origCr = detectCollisions(originalPaths,fromStep,false);
+        if(!origCr.hasCollision){
+            paths = originalPaths;
+            maxLen = (int)originalPaths[0].size();
+            if(verbose) printf(" Reverted to original paths (collision-free)\n");
+            return;
+        }
+    }
+
+    if(verbose) printf(" No collision-free replan found; leaving paths unchanged.\n");
 }
 
 bool lookaheadBlocked(int step,const vector<vector<pair<int,int>>>& paths,
@@ -611,6 +824,82 @@ void renderRobot(int r,float px,float py,float ang,
              (int)(px-20),(int)(py+14),12,BLACK);
 }
 
+// ─── shared helper: place, replan, and trigger flash ─────────────────────────
+// Returns true if an obstacle was actually placed.
+// Advances lastObsTime unconditionally so the timer is never "stuck".
+bool tryPlaceObs(
+    int ROWS, int COLS,
+    int& obsPlaced,
+    vector<pair<int,int>>& obstacles,
+    const function<bool(int,int)>& isProtected,
+    const function<bool(int,int)>& isRobotHere,
+    int step,
+    bool simStarted, bool pathsReady,
+    int& lastReplanStep,
+    vector<vector<pair<int,int>>>& paths, int& maxLen,
+    const vector<pair<int,int>>& goals,
+    double now, double& lastObsTime,
+    bool& replanFlash, double& replanFlashTime, double& lastStepTime)
+{
+    lastObsTime = now;   // always advance — prevents hammering on failure
+    for(int att = 0; att < 1000; att++){
+        int x = rand()%ROWS, y = rand()%COLS;
+        if(grid[x][y]==0 && !isProtected(x,y) && !isRobotHere(x,y)){
+            grid[x][y]=1; obstacles.push_back({x,y}); obsPlaced++;
+            printf("[OBS #%d] placed at (%d,%d)\n", obsPlaced, x, y);
+            if(simStarted && pathsReady && lastReplanStep != step){
+                replanAll(step, goals, paths, maxLen, true);
+                lastReplanStep = step;
+                replanFlash = true; replanFlashTime = now;
+                lastStepTime = now;
+            }
+            return true;
+        }
+    }
+    printf("[OBS] No free cell found for obstacle #%d — skipping\n", obsPlaced+1);
+    return false;
+}
+
+// ─── shared helper: relocate one obstacle ────────────────────────────────────
+void tryRelocObs(
+    int ROWS, int COLS,
+    int& relocCount,
+    vector<pair<int,int>>& obstacles,
+    const function<bool(int,int)>& isProtected,
+    const function<bool(int,int)>& isRobotHere,
+    int step,
+    int& lastReplanStep,
+    vector<vector<pair<int,int>>>& paths, int& maxLen,
+    const vector<pair<int,int>>& goals,
+    double now,
+    bool& replanFlash, double& replanFlashTime, double& lastStepTime,
+    double& relocTriggerTime)
+{
+    int idx = relocCount % (int)obstacles.size();
+    auto oldPos = obstacles[idx];
+    printf("\n[RELOC #%d] (%d,%d) -> ", relocCount, oldPos.first, oldPos.second);
+    grid[oldPos.first][oldPos.second] = 0;
+    bool moved = false;
+    for(int att = 0; att < 1000; att++){
+        int nx = rand()%ROWS, ny = rand()%COLS;
+        if((nx!=oldPos.first||ny!=oldPos.second) &&
+           grid[nx][ny]==0 && !isProtected(nx,ny) && !isRobotHere(nx,ny)){
+            grid[nx][ny]=1; obstacles[idx]={nx,ny};
+            printf("(%d,%d)\n", nx, ny);
+            moved = true; break;
+        }
+    }
+    if(!moved){ grid[oldPos.first][oldPos.second]=1; printf("kept (no free cell)\n"); }
+    if(lastReplanStep != step){
+        replanAll(step, goals, paths, maxLen, true);
+        lastReplanStep = step;
+        replanFlash = true; replanFlashTime = now;
+        lastStepTime = now;
+    }
+    relocCount++;
+    relocTriggerTime = now;
+}
+
 int main(){
     srand(time(0));
     vector<pair<int,int>> start={{0,1},{0,2},{0,3},{0,4},{1,0},{2,0},{3,0},{4,0}};
@@ -638,7 +927,6 @@ int main(){
                            const vector<pair<int,int>>& curGoal){
         printf("\n--- Initial planning ---\n");
         vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
-
         for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(start[r]);
         rebuildCellLastReserved();
 
@@ -656,7 +944,24 @@ int main(){
         }
         maxLen=0;
         for(auto&p:paths) maxLen=max(maxLen,(int)p.size());
-        for(auto&p:paths) while((int)p.size()<maxLen) p.push_back(p.back());
+
+        for(int r=0;r<ROBOTS;r++){
+            while((int)paths[r].size()<maxLen){
+                auto last=paths[r].back();
+                if(last==curGoal[r]){
+                    paths[r].push_back(last);
+                    continue;
+                }
+                if((int)paths[r].size()>=2){
+                    auto prev=paths[r][paths[r].size()-2];
+                    if(prev!=last&&validCell(prev.first,prev.second)){
+                        paths[r].push_back(prev); continue;
+                    }
+                }
+                auto ss=findSideStep(last,curGoal[r],(int)paths[r].size()%MAX_TIME);
+                paths[r].push_back(ss);
+            }
+        }
 
         printf(" maxLen=%d\nValidation:\n",maxLen);
         for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],0);
@@ -674,7 +979,6 @@ int main(){
             }
         }
         printf("\n=== MODE 1 : %d static obstacles ===\n",n);
-
         vector<vector<pair<int,int>>> paths(ROBOTS);
         int maxLen=0;
         doInitialPlan(paths,maxLen,goal);
@@ -687,7 +991,6 @@ int main(){
             posX[i]=start[i].second*CELL+CELL/2.f;
             posY[i]=start[i].first*CELL+CELL/2.f;
         }
-
         while(!WindowShouldClose()){
             double now=GetTime();
             if(!started&&now-startTime>=START_DELAY){started=true;lastStep=now;}
@@ -696,7 +999,6 @@ int main(){
             if(started&&step!=lastPrinted){
                 printSingleStep(step,paths,goal); lastPrinted=step;
                 if(finished) printf("\nAll robots at goals!\n");}
-
             BeginDrawing(); ClearBackground(RAYWHITE);
             for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++){
                 if(grid[i][j]) DrawRectangle(j*CELL,i*CELL,CELL,CELL,DARKGRAY);
@@ -718,21 +1020,27 @@ int main(){
                 else if(nxt.second<cur.second) angle[r]=180;
                 renderRobot(r,posX[r],posY[r],angle[r],cur,goal[r],paths[r],colors[r]);}
             DrawRectangle(0,ROWS*CELL,COLS*CELL,40,Fade(BLACK,0.75f));
-            if(!started){
+            if(!started)
                 DrawText(("Mode1|Start in "+to_string(max(0,(int)(START_DELAY-(now-startTime))+1))+"s").c_str(),10,ROWS*CELL+10,18,WHITE);
-            }else if(finished){
+            else if(finished)
                 DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
-            }else{
+            else
                 DrawText(("Step "+to_string(step)+"/"+to_string(maxLen-1)).c_str(),10,ROWS*CELL+10,18,WHITE);
-            }
             EndDrawing();
         }
         CloseWindow(); return 0;
     }
 
+    // ── MODE 2 ──────────────────────────────────────────────────────────────
     if(mode==2){
-        const float TIME_PER_STEP=1.5f; const double START_DELAY=5.0;
-        const double OBS_INTERVAL=5.0; const double RELOC_INTERVAL=8.0;
+        // FIX 1: Increased OBS_INTERVAL from 5s to 12s so robots have more
+        //        time to adapt between consecutive obstacle placements.
+        // FIX 2: RELOC_INTERVAL slightly increased for the same reason.
+        const float TIME_PER_STEP  = 1.5f;
+        const double START_DELAY   = 5.0;
+        const double OBS_INTERVAL  = 12.0;   // was 5.0
+        const double RELOC_INTERVAL= 10.0;   // was 8.0
+
         double wallStart=GetTime();
         int obsPlaced=0; double lastObsTime=wallStart; bool allObsPlaced=false;
         bool simStarted=false; double lastStepTime=0.0;
@@ -746,64 +1054,57 @@ int main(){
         }
         bool replanFlash=false; double replanFlashTime=0.0;
         int lastPrinted=-1,lastReplanStep=-1;
-
         printf("\n=== MODE 2 : %d dynamic obstacles ===\n",n);
 
-        auto placeOneObs=[&]()->bool{
-            for(int att=0;att<1000;att++){
-                int x=rand()%ROWS,y=rand()%COLS;
-                if(grid[x][y]==0&&!isProtectedStatic(x,y)&&!isRobotAt(x,y,step,paths,simStarted)){
-                    grid[x][y]=1; obstacles.push_back({x,y}); obsPlaced++;
-                    printf("[OBS #%d] placed at (%d,%d)\n",obsPlaced,x,y); return true;}}
-            return false;};
+        // Capture closures for the shared helpers
+        auto isProtected = [&](int x,int y){ return isProtectedStatic(x,y); };
+        auto isRobotHere = [&](int x,int y){ return isRobotAt(x,y,step,paths,simStarted); };
 
         while(!WindowShouldClose()){
             double now=GetTime();
 
-            if(!allObsPlaced&&now-lastObsTime>=OBS_INTERVAL){
-                if(placeOneObs()){
-                    lastObsTime=now;
-                    if(simStarted&&pathsReady&&lastReplanStep!=step){
-                        replanAll(step,goal,paths,maxLen,true);
-                        lastReplanStep=step; replanFlash=true; replanFlashTime=now;}}
-                if(obsPlaced>=n){allObsPlaced=true;relocTriggerTime=now;}}
+            // ── obstacle placement (FIX: lastObsTime always advanced) ────────
+            if(!allObsPlaced && now-lastObsTime >= OBS_INTERVAL){
+                tryPlaceObs(ROWS,COLS,obsPlaced,obstacles,isProtected,isRobotHere,
+                            step,simStarted,pathsReady,lastReplanStep,
+                            paths,maxLen,goal,now,lastObsTime,
+                            replanFlash,replanFlashTime,lastStepTime);
+                if(obsPlaced>=n){ allObsPlaced=true; relocTriggerTime=now; }
+            }
 
             if(!simStarted&&now-wallStart>=START_DELAY){
-                simStarted=true;lastStepTime=now;
-                doInitialPlan(paths,maxLen,goal);
-                pathsReady=true;}
-
+                simStarted=true; lastStepTime=now;
+                doInitialPlan(paths,maxLen,goal); pathsReady=true;
+            }
             if(simStarted&&pathsReady&&lastReplanStep!=step){
                 if(lookaheadBlocked(step,paths,true)){
                     replanAll(step,goal,paths,maxLen,true);
-                    lastReplanStep=step; replanFlash=true; replanFlashTime=now;}}
-
-            if(simStarted&&pathsReady&&now-lastStepTime>=TIME_PER_STEP){
-                if(step<maxLen-1){step++;lastStepTime=now;}}
-
+                    lastReplanStep=step; replanFlash=true; replanFlashTime=now;
+                    lastStepTime=now;
+                }
+            }
+            if(simStarted&&pathsReady&&now-lastStepTime>=TIME_PER_STEP)
+                if(step<maxLen-1){ step++; lastStepTime=now; }
             if(simStarted&&pathsReady&&step!=lastPrinted){
-                printSingleStep(step,paths,goal); lastPrinted=step;}
+                printSingleStep(step,paths,goal); lastPrinted=step;
+            }
 
-            if(allObsPlaced&&simStarted&&pathsReady&&!obstacles.empty()
-               &&now-relocTriggerTime>=RELOC_INTERVAL){
+            // ── relocation (FIX: always triggers, even when all at goals) ────
+            if(allObsPlaced && simStarted && pathsReady && !obstacles.empty()
+               && now-relocTriggerTime >= RELOC_INTERVAL){
                 if(allAtGoals(step,paths,goal)){
-                    relocTriggerTime=now;
-                }else{
-                    int idx=relocCount%(int)obstacles.size();
-                    auto oldPos=obstacles[idx];
-                    printf("\n[RELOC #%d] (%d,%d)->",relocCount,oldPos.first,oldPos.second);
-                    grid[oldPos.first][oldPos.second]=0;
-                    bool moved=false;
-                    for(int att=0;att<1000;att++){
-                        int nx2=rand()%ROWS,ny2=rand()%COLS;
-                        if(grid[nx2][ny2]==0&&!isProtectedStatic(nx2,ny2)&&!isRobotAt(nx2,ny2,step,paths,simStarted)){
-                            grid[nx2][ny2]=1; obstacles[idx]={nx2,ny2};
-                            printf("(%d,%d)\n",nx2,ny2); moved=true; break;}}
-                    if(!moved){grid[oldPos.first][oldPos.second]=1;printf("kept\n");}
-                    if(lastReplanStep!=step){
-                        replanAll(step,goal,paths,maxLen,true);
-                        lastReplanStep=step; replanFlash=true; replanFlashTime=now;}
-                    relocCount++; relocTriggerTime=now;}}
+                    // Robots already done — still count as a relocation cycle
+                    // so obstacles continue moving after the task completes.
+                    printf("[RELOC] All at goals — still relocating for continuous demo\n");
+                    tryRelocObs(ROWS,COLS,relocCount,obstacles,isProtected,isRobotHere,
+                                step,lastReplanStep,paths,maxLen,goal,now,
+                                replanFlash,replanFlashTime,lastStepTime,relocTriggerTime);
+                } else {
+                    tryRelocObs(ROWS,COLS,relocCount,obstacles,isProtected,isRobotHere,
+                                step,lastReplanStep,paths,maxLen,goal,now,
+                                replanFlash,replanFlashTime,lastStepTime,relocTriggerTime);
+                }
+            }
 
             BeginDrawing(); ClearBackground(RAYWHITE);
             for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++){
@@ -831,44 +1132,42 @@ int main(){
             if(!simStarted){
                 DrawText(("Mode2|Start in "+to_string(max(0,(int)(START_DELAY-(now-wallStart))+1))+"s").c_str(),10,ROWS*CELL+10,18,WHITE);
             }else{
-                bool allDone=simStarted&&pathsReady&&allAtGoals(step,paths,goal);
-                if(allDone){
-                    DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
-                }else{
+                bool allDone=allAtGoals(step,paths,goal);
+                if(allDone) DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
+                else{
                     string msg=allObsPlaced
                         ?("Step "+to_string(step)+"/"+to_string(maxLen-1)+" | Relocs:"+to_string(relocCount))
                         :("Placing obs "+to_string(obsPlaced)+"/"+to_string(n));
                     DrawText(msg.c_str(),10,ROWS*CELL+10,18,WHITE);
-                    if(replanFlash&&now-replanFlashTime<1.0){
-                        DrawText("REPLAN",400,ROWS*CELL+10,18,YELLOW);
-                    }else replanFlash=false;
+                    if(replanFlash&&now-replanFlashTime<1.0) DrawText("REPLAN",400,ROWS*CELL+10,18,YELLOW);
+                    else replanFlash=false;
                 }}
             EndDrawing();
         }
         CloseWindow(); return 0;
     }
 
+    // ── MODE 3 ──────────────────────────────────────────────────────────────
     if(mode==3){
         vector<pair<int,int>> rowGoalPool={{5,1},{5,2},{5,3},{5,4}};
         vector<pair<int,int>> colGoalPool={{1,5},{2,5},{3,5},{4,5}};
-
-        std::random_device rd;
-        std::mt19937 rng(rd());
+        std::random_device rd; std::mt19937 rng(rd());
         shuffle(rowGoalPool.begin(),rowGoalPool.end(),rng);
         shuffle(colGoalPool.begin(),colGoalPool.end(),rng);
-
         goal.clear();
         for(int i=0;i<4;i++) goal.push_back(rowGoalPool[i]);
         for(int i=0;i<4;i++) goal.push_back(colGoalPool[i]);
-
         printf("\n=== MODE 3 : Random Goals + Dynamic ===\n");
-        printf("Goals:\n");
         for(int r=0;r<ROBOTS;r++)
             printf(" %s: (%d,%d)->(%d,%d)\n",ROBOT_NAMES[r],
                    start[r].first,start[r].second,goal[r].first,goal[r].second);
 
-        const float TIME_PER_STEP=1.5f; const double START_DELAY=5.0;
-        const double OBS_INTERVAL=5.0; const double RELOC_INTERVAL=8.0;
+        // Same timing fixes as mode 2
+        const float TIME_PER_STEP  = 1.5f;
+        const double START_DELAY   = 5.0;
+        const double OBS_INTERVAL  = 12.0;   // was 5.0
+        const double RELOC_INTERVAL= 10.0;   // was 8.0
+
         double wallStart=GetTime();
         int obsPlaced=0; double lastObsTime=wallStart; bool allObsPlaced=false;
         bool simStarted=false; double lastStepTime=0.0;
@@ -883,61 +1182,43 @@ int main(){
         bool replanFlash=false; double replanFlashTime=0.0;
         int lastPrinted=-1,lastReplanStep=-1;
 
-        auto placeOneObs=[&]()->bool{
-            for(int att=0;att<1000;att++){
-                int x=rand()%ROWS,y=rand()%COLS;
-                if(grid[x][y]==0&&!isProtectedStatic(x,y)&&!isRobotAt(x,y,step,paths,simStarted)){
-                    grid[x][y]=1; obstacles.push_back({x,y}); obsPlaced++;
-                    printf("[OBS #%d] at (%d,%d)\n",obsPlaced,x,y); return true;}}
-            return false;};
+        auto isProtected = [&](int x,int y){ return isProtectedStatic(x,y); };
+        auto isRobotHere = [&](int x,int y){ return isRobotAt(x,y,step,paths,simStarted); };
 
         while(!WindowShouldClose()){
             double now=GetTime();
 
-            if(!allObsPlaced&&now-lastObsTime>=OBS_INTERVAL){
-                if(placeOneObs()){
-                    lastObsTime=now;
-                    if(simStarted&&pathsReady&&lastReplanStep!=step){
-                        replanAll(step,goal,paths,maxLen,true);
-                        lastReplanStep=step; replanFlash=true; replanFlashTime=now;}}
-                if(obsPlaced>=n){allObsPlaced=true;relocTriggerTime=now;}}
+            if(!allObsPlaced && now-lastObsTime >= OBS_INTERVAL){
+                tryPlaceObs(ROWS,COLS,obsPlaced,obstacles,isProtected,isRobotHere,
+                            step,simStarted,pathsReady,lastReplanStep,
+                            paths,maxLen,goal,now,lastObsTime,
+                            replanFlash,replanFlashTime,lastStepTime);
+                if(obsPlaced>=n){ allObsPlaced=true; relocTriggerTime=now; }
+            }
 
             if(!simStarted&&now-wallStart>=START_DELAY){
-                simStarted=true;lastStepTime=now;
-                doInitialPlan(paths,maxLen,goal);
-                pathsReady=true;}
-
+                simStarted=true; lastStepTime=now;
+                doInitialPlan(paths,maxLen,goal); pathsReady=true;
+            }
             if(simStarted&&pathsReady&&lastReplanStep!=step){
                 if(lookaheadBlocked(step,paths,true)){
                     replanAll(step,goal,paths,maxLen,true);
-                    lastReplanStep=step; replanFlash=true; replanFlashTime=now;}}
-
-            if(simStarted&&pathsReady&&now-lastStepTime>=TIME_PER_STEP){
-                if(step<maxLen-1){step++;lastStepTime=now;}}
-
+                    lastReplanStep=step; replanFlash=true; replanFlashTime=now;
+                    lastStepTime=now;
+                }
+            }
+            if(simStarted&&pathsReady&&now-lastStepTime>=TIME_PER_STEP)
+                if(step<maxLen-1){ step++; lastStepTime=now; }
             if(simStarted&&pathsReady&&step!=lastPrinted){
-                printSingleStep(step,paths,goal); lastPrinted=step;}
+                printSingleStep(step,paths,goal); lastPrinted=step;
+            }
 
-            if(allObsPlaced&&simStarted&&pathsReady&&!obstacles.empty()
-               &&now-relocTriggerTime>=RELOC_INTERVAL){
-                if(allAtGoals(step,paths,goal)){
-                    relocTriggerTime=now;
-                }else{
-                    int idx=relocCount%(int)obstacles.size();
-                    auto oldPos=obstacles[idx];
-                    printf("\n[RELOC #%d] (%d,%d)->",relocCount,oldPos.first,oldPos.second);
-                    grid[oldPos.first][oldPos.second]=0;
-                    bool moved=false;
-                    for(int att=0;att<1000;att++){
-                        int nx2=rand()%ROWS,ny2=rand()%COLS;
-                        if(grid[nx2][ny2]==0&&!isProtectedStatic(nx2,ny2)&&!isRobotAt(nx2,ny2,step,paths,simStarted)){
-                            grid[nx2][ny2]=1; obstacles[idx]={nx2,ny2};
-                            printf("(%d,%d)\n",nx2,ny2); moved=true; break;}}
-                    if(!moved){grid[oldPos.first][oldPos.second]=1;printf("kept\n");}
-                    if(lastReplanStep!=step){
-                        replanAll(step,goal,paths,maxLen,true);
-                        lastReplanStep=step; replanFlash=true; replanFlashTime=now;}
-                    relocCount++; relocTriggerTime=now;}}
+            if(allObsPlaced && simStarted && pathsReady && !obstacles.empty()
+               && now-relocTriggerTime >= RELOC_INTERVAL){
+                tryRelocObs(ROWS,COLS,relocCount,obstacles,isProtected,isRobotHere,
+                            step,lastReplanStep,paths,maxLen,goal,now,
+                            replanFlash,replanFlashTime,lastStepTime,relocTriggerTime);
+            }
 
             BeginDrawing(); ClearBackground(RAYWHITE);
             for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++){
@@ -965,17 +1246,15 @@ int main(){
             if(!simStarted){
                 DrawText(("Mode3|Start in "+to_string(max(0,(int)(START_DELAY-(now-wallStart))+1))+"s").c_str(),10,ROWS*CELL+10,18,WHITE);
             }else{
-                bool allDone=simStarted&&pathsReady&&allAtGoals(step,paths,goal);
-                if(allDone){
-                    DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
-                }else{
+                bool allDone=allAtGoals(step,paths,goal);
+                if(allDone) DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
+                else{
                     string msg=allObsPlaced
                         ?("Step "+to_string(step)+"/"+to_string(maxLen-1)+" | Relocs:"+to_string(relocCount))
                         :("Placing obs "+to_string(obsPlaced)+"/"+to_string(n));
                     DrawText(msg.c_str(),10,ROWS*CELL+10,18,WHITE);
-                    if(replanFlash&&now-replanFlashTime<1.0){
-                        DrawText("REPLAN",400,ROWS*CELL+10,18,YELLOW);
-                    }else replanFlash=false;
+                    if(replanFlash&&now-replanFlashTime<1.0) DrawText("REPLAN",400,ROWS*CELL+10,18,YELLOW);
+                    else replanFlash=false;
                 }}
             EndDrawing();
         }
