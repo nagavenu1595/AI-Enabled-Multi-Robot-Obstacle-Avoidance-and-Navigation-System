@@ -2,332 +2,515 @@
 #include "raylib.h"
 using namespace std;
 
-const int ROWS = 6;
-const int COLS = 6;
-const int CELL = 80;
-const int ROBOTS = 8;
-const int MAX_TIME = 250;
-const int LOOKAHEAD = 3;
+/* ================================================================ CONFIG */
+static const int ROWS=6, COLS=6, CELL=80, ROBOTS=8;
+static const int MAX_TIME=400, LOOKAHEAD=4;
+static const int GOAL_HOLD_STEPS=2;
+static const int BACKTRACK_PENALTY=2;
+static const int REVISIT_WINDOW=3;
+static const int MAX_REPLAN_ATTEMPTS=5, YIELD_WAIT_STEPS=3;
+static const int WAIT_PENALTY=0;
 
-const int OVERSHOOT_PENALTY   = 4;
-const int GOAL_HOLD_STEPS     = 15;
-const int BACKTRACK_PENALTY   = 8;
-const int REVISIT_WINDOW      = 8;
-const int MAX_REPLAN_ATTEMPTS = 3;
-const int YIELD_WAIT_STEPS    = 3;
-const int WAIT_PENALTY        = 50;
+static const float SPEED_MIN_GLOBAL=0.30f;
+static const float SPEED_MAX_GLOBAL=1.50f;
+static const float SPEED_BASE=1.00f;
+static const int   VIC_MIN_GLOBAL=1;
+static const int   VIC_MAX_GLOBAL=4;
+static const float COLL_PROB_HIGH=0.70f;
+static const float COLL_PROB_MED=0.40f;
+static const float EMA_ALPHA=0.65f;
 
-map<int, set<pair<int,int>>>                         vertexRes;
-map<int, set<pair<pair<int,int>,pair<int,int>>>>     edgeRes;
-int grid[ROWS][COLS];
+static const double SIM_START_DELAY = 4.0;   // wall-clock seconds before sim
+static const double TPS              = 1.4;   // seconds per logical step
+// Obstacle timing: spread all n obstacles so the last one fires at
+// OBS_END_FRAC * (EST_SIM_STEPS * TPS) seconds into the simulation.
+// With TPS=1.4 and EST_SIM_STEPS=14 => ~19.6 s total; 65% => ~12.7 s window.
+static const double OBS_END_FRAC   = 0.65;
+static const int    EST_SIM_STEPS  = 14;
 
-const char* ROBOT_NAMES[ROBOTS] = {
+/* ================================================================ GLOBALS */
+static map<int,set<pair<int,int>>>                     vertexRes;
+static map<int,set<pair<pair<int,int>,pair<int,int>>>> edgeRes;
+static int grid[ROWS][COLS];
+static map<pair<int,int>,int> cellLastReserved;
+
+static const char* ROBOT_NAMES[ROBOTS]={
     "R0(RED)","R1(BLUE)","R2(GREEN)","R3(ORANGE)",
     "R4(PURPLE)","R5(BROWN)","R6(DKGRN)","R7(MAROON)"
 };
 
-struct Node { int x,y,t,g,h; Node* parent; };
-struct Cmp {
-    bool operator()(const Node* a,const Node* b) const {
-        return (a->g+a->h)>(b->g+b->h);
-    }
-};
-
-bool validCell(int x,int y){
+/* ================================================================ HELPERS */
+static bool validCell(int x,int y){
     return x>=0&&y>=0&&x<ROWS&&y<COLS&&grid[x][y]==0;
 }
-
-int heuristic(int nx,int ny,int gx,int gy){
-    int base=abs(nx-gx)+abs(ny-gy);
-    int pen=0;
-    if(nx>gx) pen+=OVERSHOOT_PENALTY*(nx-gx);
-    if(nx<gx) pen+=OVERSHOOT_PENALTY*(gx-nx)/2;
-    if(ny>gy) pen+=OVERSHOOT_PENALTY*(ny-gy);
-    if(ny<gy) pen+=OVERSHOOT_PENALTY*(gy-ny)/2;
-    return base+pen;
+static void rebuildCellLastReserved(){
+    cellLastReserved.clear();
+    for(auto&[t,cells]:vertexRes)
+        for(auto&c:cells){
+            auto it=cellLastReserved.find(c);
+            if(it==cellLastReserved.end()||t>it->second) cellLastReserved[c]=t;
+        }
+}
+static bool goalCanSettle(pair<int,int> c,int fromT){
+    auto it=cellLastReserved.find(c);
+    return it==cellLastReserved.end()||it->second<fromT;
 }
 
-vector<pair<int,int>> reconstruct(Node* n){
+/* ================================================================ A* */
+struct ANode{int x,y,t,g,h; ANode*parent;};
+struct ACmp{bool operator()(const ANode*a,const ANode*b)const{
+    return(a->g+a->h)>(b->g+b->h);}};
+
+static int heuristic(int nx,int ny,int gx,int gy){
+    return abs(nx-gx)+abs(ny-gy);
+}
+static vector<pair<int,int>> reconstruct(ANode*n){
     vector<pair<int,int>> p;
     while(n){p.push_back({n->x,n->y});n=n->parent;}
     reverse(p.begin(),p.end());
     return p;
 }
-
-bool recentlyVisited(Node* cur,int nx,int ny){
-    Node* p=cur;
+static bool recentlyVisited(ANode*cur,int nx,int ny){
+    ANode*p=cur;
     for(int i=0;i<REVISIT_WINDOW&&p;i++,p=p->parent)
         if(p->x==nx&&p->y==ny) return true;
     return false;
 }
-
-map<pair<int,int>, int> cellLastReserved;
-
-void rebuildCellLastReserved(){
-    cellLastReserved.clear();
-    for(auto&[t,cells]:vertexRes)
-        for(auto& cell:cells){
-            auto it=cellLastReserved.find(cell);
-            if(it==cellLastReserved.end()||t>it->second)
-                cellLastReserved[cell]=t;
-        }
-}
-
-static bool goalCanSettle(pair<int,int> cell,int fromT){
-    auto it=cellLastReserved.find(cell);
-    if(it==cellLastReserved.end()) return true;
-    return it->second < fromT;
-}
-
-pair<int,int> findSideStep(pair<int,int> pos, pair<int,int> goal, int atTime=1){
-    int gdx = goal.first  - pos.first;
-    int gdy = goal.second - pos.second;
-    vector<pair<int,int>> cands;
-    if(abs(gdx) >= abs(gdy)){
-        cands = {{pos.first,pos.second+1},{pos.first,pos.second-1},
-                 {pos.first+1,pos.second},{pos.first-1,pos.second}};
-    } else {
-        cands = {{pos.first+1,pos.second},{pos.first-1,pos.second},
-                 {pos.first,pos.second+1},{pos.first,pos.second-1}};
-    }
-    for(auto [nx,ny] : cands)
-        if(nx>=0 && ny>=0 && nx<ROWS && ny<COLS && validCell(nx,ny) && !vertexRes[atTime].count({nx,ny}))
-            return {nx,ny};
-    return pos;
-}
-
-string dirLabel(pair<int,int> f,pair<int,int> t){
-    int dr=t.first-f.first,dc=t.second-f.second;
-    if(dr==0&&dc==0)  return "HOLD ";
-    if(dr==1&&dc==0)  return "DOWN ";
-    if(dr==-1&&dc==0) return "UP   ";
-    if(dr==0&&dc==1)  return "RIGHT";
-    if(dr==0&&dc==-1) return "LEFT ";
-    return "DIAG?";
-}
-
-bool strictMoveOK(pair<int,int> from,pair<int,int> to){
-    return (abs(to.first-from.first)+abs(to.second-from.second))<=1;
-}
-
-struct CollisionReport {
-    bool hasCollision = false;
-    vector<int> affectedRobots;
-    int timeStep = -1;
-    string description;
-};
-
-CollisionReport detectCollisions(const vector<vector<pair<int,int>>>& paths,
-                                  int fromStep=0, bool verbose=false) {
-    CollisionReport report;
-    int maxLen = 0;
-    for(auto& p : paths) maxLen = max(maxLen, (int)p.size());
-    for(int t = fromStep; t < maxLen; t++) {
-        map<pair<int,int>, vector<int>> cellOccupancy;
-        for(int r = 0; r < ROBOTS; r++) {
-            int idx = min(t, (int)paths[r].size()-1);
-            cellOccupancy[paths[r][idx]].push_back(r);
-        }
-        for(auto& [pos, robots] : cellOccupancy) {
-            if(robots.size() > 1) {
-                report.hasCollision = true;
-                report.timeStep = t;
-                report.description = "VERTEX @("+to_string(pos.first)+","+to_string(pos.second)+") t="+to_string(t);
-                report.affectedRobots = robots;
-                if(verbose) printf(" !! Collision: %s\n", report.description.c_str());
-                return report;
-            }
-        }
-        if(t > fromStep) {
-            for(int r1 = 0; r1 < ROBOTS; r1++) {
-                auto p1p = paths[r1][min(t-1,(int)paths[r1].size()-1)];
-                auto p1c = paths[r1][min(t,  (int)paths[r1].size()-1)];
-                for(int r2 = r1+1; r2 < ROBOTS; r2++) {
-                    auto p2p = paths[r2][min(t-1,(int)paths[r2].size()-1)];
-                    auto p2c = paths[r2][min(t,  (int)paths[r2].size()-1)];
-                    if(p1p==p2c && p1c==p2p && p1p!=p1c) {
-                        report.hasCollision = true;
-                        report.timeStep = t;
-                        report.affectedRobots = {r1, r2};
-                        report.description = "EDGE swap t="+to_string(t)+
-                            " "+ROBOT_NAMES[r1]+"<->"+ROBOT_NAMES[r2];
-                        if(verbose) printf(" !! Collision: %s\n", report.description.c_str());
-                        return report;
-                    }
-                }
-            }
-        }
-    }
-    return report;
-}
-
-bool validatePath(int r,const vector<pair<int,int>>& path,int fromStep=0,bool verbose=true){
-    bool bad=false;
-    for(int t=max(1,fromStep);t<(int)path.size();t++){
-        int dr=abs(path[t].first-path[t-1].first);
-        int dc=abs(path[t].second-path[t-1].second);
-        if(dr+dc>1){
-            if(verbose)
-                printf(" !! ILLEGAL MOVE %s step%d->%d: (%d,%d)->(%d,%d)\n",
-                       ROBOT_NAMES[r],t-1,t,
-                       path[t-1].first,path[t-1].second,
-                       path[t].first,path[t].second);
-            bad=true;
-        }
-    }
-    if(!bad&&verbose) printf(" %s OK (%d steps)\n",ROBOT_NAMES[r],(int)path.size());
-    return !bad;
-}
-
-void printSingleStep(int step,
-                     const vector<vector<pair<int,int>>>& paths,
-                     const vector<pair<int,int>>& goals)
-{
-    printf("\n[STEP %d]\n",step);
-    for(int r=0;r<ROBOTS;r++){
-        int ct=min(step,(int)paths[r].size()-1);
-        int nt=min(step+1,(int)paths[r].size()-1);
-        auto cur=paths[r][ct], nxt=paths[r][nt];
-        bool atGoal     =(cur==goals[r]);
-        bool illegalMove=!strictMoveOK(cur,nxt);
-        bool trulyStuck =((int)paths[r].size()<=1&&!atGoal);
-        bool forcedWait =(cur==nxt && !atGoal);
-        int distCur = abs(cur.first-goals[r].first)+abs(cur.second-goals[r].second);
-        int distNxt = abs(nxt.first-goals[r].first)+abs(nxt.second-goals[r].second);
-        bool isSlow  = (!atGoal && cur!=nxt && distNxt >= distCur);
-        bool wasAtGoal = (step>0 &&
-                          paths[r][min(step-1,(int)paths[r].size()-1)]==goals[r]);
-        bool isYielding = (!atGoal && wasAtGoal);
-        printf(" %-14s (%d,%d)->(%d,%d) [%s]%s%s%s%s%s%s\n",
-               ROBOT_NAMES[r],
-               cur.first,cur.second,nxt.first,nxt.second,
-               dirLabel(cur,nxt).c_str(),
-               atGoal      ?" GOAL!":"",
-               isYielding  ?" YIELDING":"",
-               isSlow      ?" SLOW":"",
-               trulyStuck  ?" STUCK":"",
-               forcedWait  ?" FORCED-WAIT":"",
-               illegalMove ?" ILLEGAL!":"");
-    }
-}
-
-vector<pair<int,int>> timeExpandedAStar(pair<int,int> s,pair<int,int> g,
-                                         bool startOnObs=false, int localMaxTime = MAX_TIME)
-{
-    vector<Node*> pool;
-    auto makeNode=[&](int x,int y,int t,int gc,int h,Node* par)->Node*{
-        Node* n=new Node{x,y,t,gc,h,par};
-        pool.push_back(n);
-        return n;
+static vector<pair<int,int>> timeExpandedAStar(
+        pair<int,int>s,pair<int,int>g,
+        bool /*startOnObs*/=false,int localMax=MAX_TIME){
+    vector<ANode*> pool;
+    auto mk=[&](int x,int y,int t,int gc,int h,ANode*par)->ANode*{
+        auto*n=new ANode{x,y,t,gc,h,par};
+        pool.push_back(n); return n;
     };
-
-    priority_queue<Node*,vector<Node*>,Cmp> pq;
-    map<tuple<int,int,int>,bool> visited;
-
-    pq.push(makeNode(s.first,s.second,0,0,
-                     heuristic(s.first,s.second,g.first,g.second),nullptr));
-
+    struct Guard{vector<ANode*>&p;~Guard(){for(auto*n:p)delete n;}} guard{pool};
+    priority_queue<ANode*,vector<ANode*>,ACmp> pq;
+    map<tuple<int,int,int>,int> minG;
+    pq.push(mk(s.first,s.second,0,0,heuristic(s.first,s.second,g.first,g.second),nullptr));
     vector<pair<int,int>> result;
-
     while(!pq.empty()){
-        Node* cur=pq.top(); pq.pop();
+        ANode*cur=pq.top(); pq.pop();
         auto key=make_tuple(cur->x,cur->y,cur->t);
-        if(visited.count(key)) continue;
-        visited[key]=true;
-
-        if(cur->x==g.first&&cur->y==g.second&&
-           goalCanSettle({cur->x,cur->y},cur->t)){
-            result=reconstruct(cur);
-            break;
+        auto it=minG.find(key);
+        if(it!=minG.end()&&cur->g>=it->second) continue;
+        minG[key]=cur->g;
+        if(cur->x==g.first&&cur->y==g.second&&goalCanSettle({cur->x,cur->y},cur->t)){
+            result=reconstruct(cur); break;
         }
-        if(cur->t>=localMaxTime) continue;
-
+        if(cur->t>=localMax) continue;
         for(auto[dx,dy]:vector<pair<int,int>>{{0,0},{1,0},{-1,0},{0,1},{0,-1}}){
-            int nx=cur->x+dx, ny=cur->y+dy, nt=cur->t+1;
+            int nx=cur->x+dx,ny=cur->y+dy,nt=cur->t+1;
             if(nx<0||ny<0||nx>=ROWS||ny>=COLS) continue;
             if(grid[nx][ny]!=0) continue;
             if(vertexRes[nt].count({nx,ny})) continue;
-            bool isWait=(dx==0&&dy==0);
-            if(!isWait && edgeRes[nt].count({{nx,ny},{cur->x,cur->y}})) continue;
-            bool revisit=(!isWait)&&recentlyVisited(cur,nx,ny);
-            int extra_g=isWait?WAIT_PENALTY:(revisit?BACKTRACK_PENALTY:0);
-            pq.push(makeNode(nx,ny,nt,
-                             cur->g+1+extra_g,
-                             heuristic(nx,ny,g.first,g.second),
-                             cur));
+            bool isW=(dx==0&&dy==0);
+            if(!isW&&edgeRes[nt].count({{nx,ny},{cur->x,cur->y}})) continue;
+            bool rev=(!isW)&&recentlyVisited(cur,nx,ny);
+            int ng=cur->g+1+(isW?WAIT_PENALTY:(rev?BACKTRACK_PENALTY:0));
+            auto nkey=make_tuple(nx,ny,nt);
+            auto nit=minG.find(nkey);
+            if(nit!=minG.end()&&ng>=nit->second) continue;
+            pq.push(mk(nx,ny,nt,ng,heuristic(nx,ny,g.first,g.second),cur));
         }
     }
-
-    for(Node* n:pool) delete n;
     if(result.empty()) result={s};
-
     for(int i=1;i<(int)result.size();i++){
-        int dr=abs(result[i].first-result[i-1].first);
-        int dc=abs(result[i].second-result[i-1].second);
-        if(dr+dc>1){
-            printf(" !! [A* SAFETY] Illegal move, truncating\n");
+        if(abs(result[i].first-result[i-1].first)+
+           abs(result[i].second-result[i-1].second)>1){
             result.resize(i); break;
         }
     }
     return result;
 }
 
-void reservePath(const vector<pair<int,int>>& path){
-    for(int t=0;t<(int)path.size();t++){
-        vertexRes[t].insert(path[t]);
-        if(t>0){
-            edgeRes[t].insert({path[t-1],path[t]});
-            edgeRes[t].insert({path[t],path[t-1]});
-        }
+/* ================================================================ RESERVATIONS */
+static void reservePath(const vector<pair<int,int>>&p){
+    for(int t=0;t<(int)p.size();t++){
+        vertexRes[t].insert(p[t]);
+        if(t>0){edgeRes[t].insert({p[t-1],p[t]}); edgeRes[t].insert({p[t],p[t-1]});}
     }
-    auto gp=path.back();
-    int holdUntil=min((int)path.size()+GOAL_HOLD_STEPS,MAX_TIME);
-    for(int t=(int)path.size();t<holdUntil;t++)
-        vertexRes[t].insert(gp);
+    auto gp=p.back();
+    int h=min((int)p.size()+GOAL_HOLD_STEPS,MAX_TIME);
+    for(int t=(int)p.size();t<h;t++) vertexRes[t].insert(gp);
+    rebuildCellLastReserved();
+}
+static void erasePathReservations(const vector<pair<int,int>>&p){
+    for(int t=0;t<(int)p.size();t++){
+        vertexRes[t].erase(p[t]);
+        if(t>0){edgeRes[t].erase({p[t-1],p[t]}); edgeRes[t].erase({p[t],p[t-1]});}
+    }
+    auto gp=p.back();
+    int h=min((int)p.size()+GOAL_HOLD_STEPS,MAX_TIME);
+    for(int t=(int)p.size();t<h;t++) vertexRes[t].erase(gp);
     rebuildCellLastReserved();
 }
 
-void erasePathReservations(const vector<pair<int,int>>& path){
-    for(int t=0;t<(int)path.size();t++){
-        vertexRes[t].erase(path[t]);
-        if(t>0){
-            edgeRes[t].erase({path[t-1],path[t]});
-            edgeRes[t].erase({path[t],path[t-1]});
+/* ================================================================ COLLISION */
+struct CollisionReport{
+    bool hasCollision=false;
+    vector<int> affectedRobots;
+    int timeStep=-1;
+    string description;
+};
+static CollisionReport detectCollisions(
+        const vector<vector<pair<int,int>>>&paths,
+        int from=0,int toStep=-1,bool verbose=false){
+    CollisionReport rep;
+    int ml=0;
+    for(auto&p:paths) ml=max(ml,(int)p.size());
+    if(toStep>=0) ml=min(ml,toStep);
+    for(int t=from;t<ml;t++){
+        map<pair<int,int>,vector<int>> occ;
+        for(int r=0;r<ROBOTS;r++)
+            occ[paths[r][min(t,(int)paths[r].size()-1)]].push_back(r);
+        for(auto&[pos,rs]:occ){
+            if(rs.size()>1){
+                rep.hasCollision=true; rep.timeStep=t;
+                rep.description="VERTEX@("+to_string(pos.first)+","+
+                                to_string(pos.second)+")t="+to_string(t);
+                rep.affectedRobots=rs;
+                if(verbose) printf(" !! %s\n",rep.description.c_str());
+                return rep;
+            }
+        }
+        if(t>from){
+            for(int r1=0;r1<ROBOTS;r1++){
+                auto p1p=paths[r1][min(t-1,(int)paths[r1].size()-1)];
+                auto p1c=paths[r1][min(t,  (int)paths[r1].size()-1)];
+                for(int r2=r1+1;r2<ROBOTS;r2++){
+                    auto p2p=paths[r2][min(t-1,(int)paths[r2].size()-1)];
+                    auto p2c=paths[r2][min(t,  (int)paths[r2].size()-1)];
+                    if(p1p==p2c&&p1c==p2p&&p1p!=p1c){
+                        rep.hasCollision=true; rep.timeStep=t;
+                        rep.affectedRobots={r1,r2};
+                        rep.description="EDGE t="+to_string(t)+" "+
+                                       ROBOT_NAMES[r1]+"<->"+ROBOT_NAMES[r2];
+                        if(verbose) printf(" !! %s\n",rep.description.c_str());
+                        return rep;
+                    }
+                }
+            }
         }
     }
-    auto gp=path.back();
-    int holdUntil=min((int)path.size()+GOAL_HOLD_STEPS,MAX_TIME);
-    for(int t=(int)path.size();t<holdUntil;t++)
-        vertexRes[t].erase(gp);
-    rebuildCellLastReserved();
+    return rep;
 }
 
-vector<int> planningOrder(const vector<pair<int,int>>& pos,
-                          const vector<pair<int,int>>& goals,
-                          const set<int>& priorityOverride={})
-{
-    vector<int> overrideList(priorityOverride.begin(), priorityOverride.end());
+/* ================================================================ DECISIONS */
+enum class Decision{PROCEED,SLOW,WAIT,DEVIATE,STEPBACK,YIELD_TO_OTHER};
+static const char* decisionName(Decision d){
+    switch(d){
+        case Decision::PROCEED:        return "PROCEED";
+        case Decision::SLOW:           return "SLOW";
+        case Decision::WAIT:           return "WAIT";
+        case Decision::DEVIATE:        return "DEVIATE";
+        case Decision::STEPBACK:       return "STEPBACK";
+        case Decision::YIELD_TO_OTHER: return "YIELD";
+        default: return "?";
+    }
+}
+
+/* ================================================================ RobotBehavior */
+struct RobotBehavior{
+    int id;
+    pair<int,int> start,goal;
+    float speedFactor,baseSpeed,smoothedSpeed;
+    int vicMin,vicMax,nearestDist;
+    float nearestSpeed,collisionProb;
+    Decision lastDecision;
+    int waitCountdown;
+    bool stepBackActive;
+    int waitCount,behavWaitCount,deviationCells,originalPathLen;
+    vector<pair<int,int>> originalPath;
+    float px,py,angle;
+
+    RobotBehavior()=default;
+    RobotBehavior(int _id,pair<int,int> s,pair<int,int> g){
+        id=_id; start=s; goal=g;
+        px=s.second*CELL+CELL/2.f;
+        py=s.first *CELL+CELL/2.f;
+        angle=0.f;
+        baseSpeed=SPEED_BASE+((float)(rand()%21)-10)/100.f;
+        speedFactor=smoothedSpeed=baseSpeed;
+        vicMin=VIC_MIN_GLOBAL; vicMax=VIC_MAX_GLOBAL+(rand()%2);
+        nearestDist=vicMax; nearestSpeed=SPEED_BASE;
+        collisionProb=0.f; lastDecision=Decision::PROCEED;
+        waitCountdown=0; stepBackActive=false;
+        waitCount=behavWaitCount=deviationCells=originalPathLen=0;
+    }
+    void setOriginalPath(const vector<pair<int,int>>&p){
+        originalPath=p; originalPathLen=(int)p.size();
+    }
+    void trackStep(int step,pair<int,int> pos){
+        if(pos==goal) return;
+        if(step<originalPathLen){if(pos!=originalPath[step]) deviationCells++;}
+        else deviationCells++;
+    }
+    int computeVicinity(int step,const vector<vector<pair<int,int>>>&paths,
+                        const vector<RobotBehavior>&robots){
+        int best=ROWS+COLS+1;
+        int myIdx=min(step,(int)paths[id].size()-1);
+        auto myPos=paths[id][myIdx];
+        nearestSpeed=SPEED_BASE;
+        for(int r=0;r<ROBOTS;r++){
+            if(r==id) continue;
+            int rIdx=min(step,(int)paths[r].size()-1);
+            auto rPos=paths[r][rIdx];
+            int d=abs(myPos.first-rPos.first)+abs(myPos.second-rPos.second);
+            if(d<best){best=d; nearestSpeed=robots[r].speedFactor;}
+        }
+        return best;
+    }
+    void adjustSpeed(int dist,float neighborSpeed){
+        nearestDist=dist;
+        float zoneFloor,raw;
+        if(dist<=vicMin){zoneFloor=SPEED_MIN_GLOBAL; raw=SPEED_MIN_GLOBAL+0.05f;}
+        else if(dist==vicMin+1){
+            zoneFloor=0.35f;
+            float t=(float)(dist-vicMin)/(float)(vicMax-vicMin);
+            raw=0.35f+t*0.25f;
+        } else if(dist<=vicMax/2){
+            zoneFloor=0.55f;
+            float t=(float)(dist-vicMin)/(float)(vicMax-vicMin);
+            raw=0.55f+t*0.35f;
+        } else if(dist<=vicMax){
+            zoneFloor=baseSpeed*0.8f;
+            float t=(float)(dist-vicMax/2)/(float)max(1,vicMax-vicMax/2);
+            raw=baseSpeed+t*0.20f;
+        } else {
+            zoneFloor=baseSpeed;
+            raw=min(SPEED_MAX_GLOBAL,baseSpeed+0.30f);
+        }
+        if(dist<=vicMax&&neighborSpeed<raw){
+            float ff=1.0f-(float)(vicMax-dist)/(float)vicMax;
+            raw=raw*(1.f-ff)+neighborSpeed*ff;
+        }
+        if(dist>vicMax&&neighborSpeed>raw) raw=min(raw+0.05f,SPEED_MAX_GLOBAL);
+        raw=max(zoneFloor,min(SPEED_MAX_GLOBAL,raw));
+        smoothedSpeed=EMA_ALPHA*raw+(1.f-EMA_ALPHA)*smoothedSpeed;
+        smoothedSpeed=max(smoothedSpeed,zoneFloor);
+        speedFactor=max(SPEED_MIN_GLOBAL,min(SPEED_MAX_GLOBAL,smoothedSpeed));
+    }
+    float estimateCollisionProbability(int step,
+            const vector<vector<pair<int,int>>>&paths)const{
+        float score=0.f;
+        for(int ahead=1;ahead<=LOOKAHEAD;ahead++){
+            int t =min(step+ahead,(int)paths[id].size()-1);
+            auto mp=paths[id][t];
+            int t1=(ahead>1)?min(step+ahead-1,(int)paths[id].size()-1):-1;
+            auto mp1=(t1>=0)?paths[id][t1]:mp;
+            for(int r=0;r<ROBOTS;r++){
+                if(r==id) continue;
+                int rt =min(step+ahead,(int)paths[r].size()-1);
+                auto rp=paths[r][rt];
+                int rt1=(ahead>1)?min(step+ahead-1,(int)paths[r].size()-1):-1;
+                auto rp1=(rt1>=0)?paths[r][rt1]:rp;
+                int d=abs(mp.first-rp.first)+abs(mp.second-rp.second);
+                if(d==0)      score+=0.80f;
+                else if(d==1) score+=0.30f;
+                else if(d==2) score+=0.10f;
+                if(t1>=0&&rt1>=0&&mp1==rp&&rp1==mp&&mp1!=mp) score+=0.60f;
+            }
+        }
+        return min(1.0f,score/((ROBOTS-1)*LOOKAHEAD*0.80f));
+    }
+    float computePriority(int step,
+                          const vector<vector<pair<int,int>>>&paths)const{
+        int idx=min(step,(int)paths[id].size()-1);
+        auto pos=paths[id][idx];
+        int dist=abs(pos.first-goal.first)+abs(pos.second-goal.second);
+        return -(float)dist+speedFactor*0.5f+id*0.01f;
+    }
+    Decision decideAction(int step,const vector<vector<pair<int,int>>>&paths,
+                          const vector<RobotBehavior>&robots,bool verbose){
+        int dist=computeVicinity(step,paths,robots);
+        adjustSpeed(dist,nearestSpeed);
+        collisionProb=estimateCollisionProbability(step,paths);
+        if(waitCountdown>0){
+            --waitCountdown; waitCount++; behavWaitCount++;
+            lastDecision=Decision::WAIT; return Decision::WAIT;
+        }
+        int idx=min(step,(int)paths[id].size()-1);
+        if(paths[id][idx]==goal){lastDecision=Decision::PROCEED; return Decision::PROCEED;}
+        if(collisionProb>=COLL_PROB_HIGH){
+            float myPri=computePriority(step,paths);
+            bool iAmTop=true;
+            for(int r=0;r<ROBOTS;r++){
+                if(r==id) continue;
+                int rIdx=min(step,(int)paths[r].size()-1);
+                int d=abs(paths[id][idx].first -paths[r][rIdx].first)
+                     +abs(paths[id][idx].second-paths[r][rIdx].second);
+                if(d<=vicMax&&robots[r].computePriority(step,paths)<myPri){iAmTop=false;break;}
+            }
+            if(!iAmTop){
+                if(idx>0){
+                    auto prev=paths[id][idx-1];
+                    if(validCell(prev.first,prev.second)&&prev!=paths[id][idx]){
+                        stepBackActive=true;
+                        lastDecision=Decision::STEPBACK; return Decision::STEPBACK;
+                    }
+                }
+                waitCountdown=2; speedFactor=SPEED_MIN_GLOBAL;
+                waitCount++; behavWaitCount++;
+                lastDecision=Decision::WAIT; return Decision::WAIT;
+            }
+            lastDecision=Decision::PROCEED; return Decision::PROCEED;
+        } else if(collisionProb>=COLL_PROB_MED){
+            lastDecision=Decision::DEVIATE; return Decision::DEVIATE;
+        } else if(dist<=vicMin){
+            lastDecision=Decision::SLOW; return Decision::SLOW;
+        }
+        lastDecision=Decision::PROCEED; return Decision::PROCEED;
+    }
+    bool applyDecision(Decision dec,int step,vector<pair<int,int>>&myPath){
+        int posIdx=min(step,(int)myPath.size()-1);
+        auto cur=myPath[posIdx];
+        auto ins=[&](pair<int,int> c){
+            if(posIdx+1<=(int)myPath.size())
+                myPath.insert(myPath.begin()+posIdx+1,c);
+            else myPath.push_back(c);
+        };
+        if(dec==Decision::WAIT){ins(cur); return true;}
+        if(dec==Decision::STEPBACK){
+            if(posIdx>0){
+                auto prev=myPath[posIdx-1];
+                ins(validCell(prev.first,prev.second)?prev:cur);
+                stepBackActive=false;
+            } else {ins(cur);}
+            return true;
+        }
+        return false;
+    }
+    Decision tick(int step,vector<vector<pair<int,int>>>&paths,
+                  const vector<RobotBehavior>&robots,bool verbose){
+        Decision dec=decideAction(step,paths,robots,verbose);
+        applyDecision(dec,step,paths[id]);
+        return dec;
+    }
+    // [BUG-SMOOTH-JUMP FIX] visF is clamped cosmetic lead/lag, never overshoots 1.0
+    void updateSmooth(int step,const vector<pair<int,int>>&path,
+                      float stepFrac,float dt){
+        int curIdx=min(step,  (int)path.size()-1);
+        int nxtIdx=min(step+1,(int)path.size()-1);
+        float lead=(speedFactor-SPEED_BASE)/SPEED_MAX_GLOBAL*0.15f;
+        float visF=max(0.f,min(1.f,stepFrac+lead));
+        float cx=path[curIdx].second*CELL+CELL/2.f;
+        float cy=path[curIdx].first *CELL+CELL/2.f;
+        float nx2=path[nxtIdx].second*CELL+CELL/2.f;
+        float ny2=path[nxtIdx].first *CELL+CELL/2.f;
+        float ease=visF*visF*(3.f-2.f*visF);
+        px=cx+(nx2-cx)*ease;
+        py=cy+(ny2-cy)*ease;
+        float dx2=nx2-cx, dy2=ny2-cy;
+        if(fabsf(dx2)+fabsf(dy2)>0.5f){
+            float desired=(fabsf(dy2)>fabsf(dx2))?((dy2>0)?90.f:270.f):((dx2>0)?0.f:180.f);
+            float diff=desired-angle;
+            while(diff>180.f)diff-=360.f; while(diff<-180.f)diff+=360.f;
+            angle+=diff*min(1.f,dt*14.f);
+        }
+    }
+    void printStats()const{
+        printf("  %-14s  base=%.2f vic=%d/%d  waits=%3d(behav=%3d)  deviation=%3d\n",
+               ROBOT_NAMES[id],baseSpeed,vicMin,vicMax,
+               waitCount,behavWaitCount,deviationCells);
+    }
+};
+
+/* ================================================================ FORWARDS */
+static vector<int> planningOrder(const vector<pair<int,int>>&,
+                                 const vector<pair<int,int>>&,
+                                 const set<int>&);
+static bool allAtGoals(int,const vector<vector<pair<int,int>>>&,
+                       const vector<pair<int,int>>&);
+static void replanAll(int,const vector<pair<int,int>>&,
+                      vector<vector<pair<int,int>>>&,int&,bool,bool);
+static bool coopYield(int,bool,vector<vector<pair<int,int>>>&,
+                      const vector<pair<int,int>>&,
+                      const vector<pair<int,int>>&,bool);
+static void resolveYield(int,const vector<pair<int,int>>&,
+                         const vector<pair<int,int>>&,
+                         vector<vector<pair<int,int>>>&,bool);
+
+/* ================================================================ resolveConflicts */
+static void resolveConflicts(
+        int step,vector<vector<pair<int,int>>>&paths,
+        const vector<pair<int,int>>&goals,
+        vector<RobotBehavior>&robots,int&maxLen,bool verbose){
+    bool needsGlobalReplan=false;
+    vector<Decision> dec(ROBOTS,Decision::PROCEED);
+    for(int r=0;r<ROBOTS;r++){
+        int idx=min(step,(int)paths[r].size()-1);
+        if(paths[r][idx]==goals[r]) dec[r]=Decision::PROCEED;
+        else dec[r]=robots[r].tick(step,paths,robots,verbose);
+    }
+    for(int r=0;r<ROBOTS;r++){
+        if(dec[r]!=Decision::DEVIATE) continue;
+        int posIdx=min(step,(int)paths[r].size()-1);
+        vector<pair<int,int>> oldFull=paths[r];
+        erasePathReservations(oldFull);
+        auto newSeg=timeExpandedAStar(paths[r][posIdx],goals[r],false);
+        if((int)newSeg.size()>1){
+            paths[r].resize(posIdx);
+            for(auto&c:newSeg) paths[r].push_back(c);
+            reservePath(paths[r]); needsGlobalReplan=true;
+        } else {paths[r]=oldFull; reservePath(paths[r]);}
+    }
+    int lookWindow=min((int)paths[0].size(),step+LOOKAHEAD+2);
+    CollisionReport cr=detectCollisions(paths,step+1,lookWindow,false);
+    if(cr.hasCollision){
+        vector<pair<float,int>> ranked;
+        for(int r:cr.affectedRobots)
+            ranked.push_back({robots[r].computePriority(step,paths),r});
+        sort(ranked.begin(),ranked.end());
+        for(size_t i=1;i<ranked.size();i++){
+            int loser=ranked[i].second;
+            int posIdx=min(step,(int)paths[loser].size()-1);
+            auto cur2=paths[loser][posIdx];
+            vector<pair<int,int>> oldPath=paths[loser];
+            bool sb=false;
+            if(posIdx>0){
+                auto prev=paths[loser][posIdx-1];
+                if(validCell(prev.first,prev.second)&&prev!=cur2&&
+                   !vertexRes[step+1].count(prev)){
+                    if(posIdx+1<=(int)paths[loser].size())
+                        paths[loser].insert(paths[loser].begin()+posIdx+1,prev);
+                    else paths[loser].push_back(prev);
+                    sb=true;
+                }
+            }
+            if(!sb){
+                if(posIdx+1<=(int)paths[loser].size())
+                    paths[loser].insert(paths[loser].begin()+posIdx+1,cur2);
+                else paths[loser].push_back(cur2);
+                robots[loser].waitCountdown=1; robots[loser].waitCount++;
+            }
+            erasePathReservations(oldPath); reservePath(paths[loser]);
+        }
+    }
+    if(needsGlobalReplan) replanAll(step,goals,paths,maxLen,verbose,false);
+    for(auto&p:paths) maxLen=max(maxLen,(int)p.size());
+}
+
+/* ================================================================ PLANNER */
+static vector<int> planningOrder(const vector<pair<int,int>>&pos,
+        const vector<pair<int,int>>&goals,const set<int>&overrides={}){
+    vector<int> ol(overrides.begin(),overrides.end());
     vector<tuple<int,int,int>> di;
     for(int r=0;r<ROBOTS;r++){
-        if(priorityOverride.count(r)) continue;
-        int dist=abs(pos[r].first-goals[r].first)
-                +abs(pos[r].second-goals[r].second);
-        int grp=(r>=4)?0:1;
-        di.push_back({dist,grp,r});
+        if(overrides.count(r)) continue;
+        int d=abs(pos[r].first-goals[r].first)+abs(pos[r].second-goals[r].second);
+        di.push_back({d,(r>=4)?0:1,r});
     }
     sort(di.begin(),di.end(),[](auto&a,auto&b){
         if(get<0>(a)!=get<0>(b)) return get<0>(a)>get<0>(b);
         if(get<1>(a)!=get<1>(b)) return get<1>(a)<get<1>(b);
         return get<2>(a)<get<2>(b);
     });
-    vector<int> o=overrideList;
-    for(auto&[d,g,r]:di) o.push_back(r);
-    return o;
+    for(auto&[d,g,r]:di) ol.push_back(r);
+    return ol;
 }
-
-bool allAtGoals(int step,const vector<vector<pair<int,int>>>& paths,
-                const vector<pair<int,int>>& goals)
-{
+static bool allAtGoals(int step,const vector<vector<pair<int,int>>>&paths,
+                       const vector<pair<int,int>>&goals){
     for(int r=0;r<ROBOTS;r++){
         int t=min(step,(int)paths[r].size()-1);
         if(paths[r][t]!=goals[r]) return false;
@@ -335,471 +518,283 @@ bool allAtGoals(int step,const vector<vector<pair<int,int>>>& paths,
     return true;
 }
 
-void resolveYield(int fromStep,
-                  const vector<pair<int,int>>& goals,
-                  const vector<pair<int,int>>& curPos,
-                  vector<vector<pair<int,int>>>& newSegs,
-                  bool verbose)
-{
-    for(int stuckR=0; stuckR<ROBOTS; stuckR++){
-        if(curPos[stuckR]==goals[stuckR]) continue;
-        if((int)newSegs[stuckR].size() > 1)  continue;
-
-        if(grid[curPos[stuckR].first][curPos[stuckR].second]==1){
-            if(verbose)
-                printf(" [YIELD] %s ON obstacle (%d,%d) — side-stepping\n",
-                       ROBOT_NAMES[stuckR],curPos[stuckR].first,curPos[stuckR].second);
-            newSegs[stuckR]={curPos[stuckR]};
-            auto ss=findSideStep(curPos[stuckR],goals[stuckR],1);
-            for(int i=0;i<YIELD_WAIT_STEPS;i++)
-                newSegs[stuckR].push_back(ss);
-            reservePath(newSegs[stuckR]);
-            continue;
-        }
-
-        if(verbose)
-            printf(" [YIELD] %s stuck at (%d,%d) — scanning blocker...\n",
-                   ROBOT_NAMES[stuckR],curPos[stuckR].first,curPos[stuckR].second);
-
-        bool resolved=false;
-
-        for(int blocker=0; blocker<ROBOTS && !resolved; blocker++){
-            if(blocker==stuckR) continue;
-            if(curPos[blocker]!=goals[blocker]) continue;
-
-            erasePathReservations(newSegs[blocker]);
-            auto testPath=timeExpandedAStar(curPos[stuckR],goals[stuckR],false);
-            if((int)testPath.size()<=1){ reservePath(newSegs[blocker]); continue; }
-
-            pair<int,int> yieldCell={-1,-1};
-            for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
-                int nx=goals[blocker].first+dx, ny=goals[blocker].second+dy;
-                if(!validCell(nx,ny)||vertexRes[1].count({nx,ny})) continue;
-                yieldCell={nx,ny}; break;
-            }
-            if(yieldCell.first==-1){
-                if(verbose) printf(" [YIELD] %s has no free neighbour\n",ROBOT_NAMES[blocker]);
-                reservePath(newSegs[blocker]); continue;
-            }
-
-            if(verbose)
-                printf(" [YIELD] %s steps to (%d,%d) for %s\n",
-                       ROBOT_NAMES[blocker],yieldCell.first,yieldCell.second,
-                       ROBOT_NAMES[stuckR]);
-
-            int dist=abs(curPos[stuckR].first-goals[blocker].first)
-                    +abs(curPos[stuckR].second-goals[blocker].second);
-            int window = max(1, min(3, dist)); 
-            vector<pair<int,int>> yieldPath;
-            yieldPath.push_back(goals[blocker]);
-            for(int i=0;i<window;i++) yieldPath.push_back(yieldCell);
-            yieldPath.push_back(goals[blocker]);
-
-            newSegs[blocker]=yieldPath;
-            reservePath(yieldPath);
-
-            newSegs[stuckR]=timeExpandedAStar(curPos[stuckR],goals[stuckR],false);
-            if((int)newSegs[stuckR].size()>1){
-                reservePath(newSegs[stuckR]);
-                if(verbose)
-                    printf(" [YIELD] %s found path (%d steps)\n",
-                           ROBOT_NAMES[stuckR],(int)newSegs[stuckR].size());
-                resolved=true;
-            } else {
-                erasePathReservations(yieldPath);
-                newSegs[blocker]={goals[blocker]};
-                reservePath(newSegs[blocker]);
-                if(verbose)
-                    printf(" [YIELD] Still stuck after %s yielded — reverting\n",
-                           ROBOT_NAMES[blocker]);
-            }
-        }
-
-        if(!resolved){
-            if(verbose)
-                printf(" [YIELD] %s: no blocker — side-stepping\n",
-                       ROBOT_NAMES[stuckR]);
-            newSegs[stuckR]={curPos[stuckR]};
-            auto ss=findSideStep(curPos[stuckR],goals[stuckR],1);
-            for(int i=0;i<2;i++) newSegs[stuckR].push_back(ss);
-            reservePath(newSegs[stuckR]);
-        }
+// [BUG-ASSEMBLY + BUG-FULLREPLAN FIX]
+// Pads short paths by waiting at goal (not oscillating).
+// Clears and re-reserves ALL robots so at-goal reservations are correct.
+static vector<vector<pair<int,int>>> assembleAndReserve(
+        int fromStep,
+        const vector<vector<pair<int,int>>>&oldPaths,
+        const vector<vector<pair<int,int>>>&segs,
+        const vector<pair<int,int>>&goals){
+    vector<vector<pair<int,int>>> cand(ROBOTS);
+    for(int r=0;r<ROBOTS;r++){
+        int hl=min(fromStep+1,(int)oldPaths[r].size());
+        for(int t=0;t<hl;t++) cand[r].push_back(oldPaths[r][t]);
+        for(int t=1;t<(int)segs[r].size();t++) cand[r].push_back(segs[r][t]);
     }
+    int maxLen=0;
+    for(auto&p:cand) maxLen=max(maxLen,(int)p.size());
+    // [BUG-ASSEMBLY FIX] pad by waiting at goal only
+    for(int r=0;r<ROBOTS;r++){
+        auto padCell=goals[r];
+        while((int)cand[r].size()<maxLen) cand[r].push_back(padCell);
+    }
+    // [BUG-FULLREPLAN FIX] full clear + rebuild
+    vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+    for(int r=0;r<ROBOTS;r++) reservePath(cand[r]);
+    return cand;
 }
 
-void replanAll(int fromStep,const vector<pair<int,int>>& goals,
-               vector<vector<pair<int,int>>>& paths,int& maxLen,
-               bool verbose=false)
-{
+// [BUG-REPLAN-SKIP FIX] forceAll=true replans every non-goal robot
+static void replanAll(int fromStep,const vector<pair<int,int>>&goals,
+                      vector<vector<pair<int,int>>>&paths,
+                      int&maxLen,bool verbose,bool forceAll){
     if(!paths.empty()&&allAtGoals(fromStep,paths,goals)){
-        if(verbose) printf(" [REPLAN SKIPPED] All at goals\n");
-        return;
+        if(verbose) printf(" [REPLAN SKIP] all at goals\n"); return;
     }
+    vector<vector<pair<int,int>>> origPaths=paths;
+    vector<pair<int,int>> cp(ROBOTS);
+    for(int r=0;r<ROBOTS;r++) cp[r]=paths[r][min(fromStep,(int)paths[r].size()-1)];
 
-    vector<vector<pair<int,int>>> originalPaths = paths;
-
-    vector<pair<int,int>> curPos(ROBOTS);
+    vector<bool> nr(ROBOTS,false); int aff=0;
     for(int r=0;r<ROBOTS;r++){
-        int cs=min(fromStep,(int)paths[r].size()-1);
-        curPos[r]=paths[r][cs];
-    }
-
-    vector<bool> needsRepath(ROBOTS, false);
-    int affectedCount = 0;
-    for(int r=0;r<ROBOTS;r++){
-        if(curPos[r]==goals[r]) continue;
-        for(int t=fromStep;t<(int)paths[r].size();t++){
-            auto cell = paths[r][t];
-            if(grid[cell.first][cell.second]!=0){
-                needsRepath[r]=true;
-                affectedCount++;
-                break;
-            }
-            if(vertexRes.count(t) && vertexRes[t].count(cell)){
-                needsRepath[r]=true;
-                affectedCount++;
-                break;
+        if(cp[r]==goals[r]) continue;
+        if(forceAll){nr[r]=true; aff++;}
+        else{
+            for(int t=fromStep;t<(int)paths[r].size();t++){
+                auto c=paths[r][t];
+                if(grid[c.first][c.second]!=0){nr[r]=true;aff++;break;}
             }
         }
     }
-    if(affectedCount==0){
-        if(verbose) printf(" [REPLAN SKIPPED] No robot path blocked by obstacle (time-aware)\n");
-        return;
-    }
+    if(aff==0){if(verbose) printf(" [REPLAN SKIP] no robots affected\n"); return;}
 
     if(verbose){
-        printf("\n=== REPLAN at step %d ===\n",fromStep);
+        printf("\n=== REPLAN @ step %d forceAll=%d ===\n",fromStep,(int)forceAll);
         for(int r=0;r<ROBOTS;r++){
-            int cs=min(fromStep,(int)paths[r].size()-1);
-            auto p=paths[r][cs];
-            const char* tag = (curPos[r]==goals[r]) ? " [AT GOAL]"
-                            : needsRepath[r]         ? " [REPLANNING]"
-                            :                          " [KEPT PATH]";
-            printf(" %s : (%d,%d)%s%s\n",ROBOT_NAMES[r],p.first,p.second,
-                   grid[p.first][p.second]?" [ON OBSTACLE!]":"", tag);
+            const char*tag=(cp[r]==goals[r])?"[GOAL]":nr[r]?"[REPLAN]":"[KEEP]";
+            printf("  %s@(%d,%d) %s\n",ROBOT_NAMES[r],cp[r].first,cp[r].second,tag);
         }
     }
 
-    auto assemblePaths=[&](const vector<vector<pair<int,int>>>& segs)
-        -> vector<vector<pair<int,int>>> {
-        vector<vector<pair<int,int>>> cand(ROBOTS);
-        for(int r=0;r<ROBOTS;r++){
-            int histLen=min(fromStep+1,(int)paths[r].size());
-            for(int t=0;t<histLen;t++) cand[r].push_back(paths[r][t]);
-            if(!segs[r].empty()&&segs[r][0]!=curPos[r]&&verbose)
-                printf(" [WARNING] %s discontinuity\n",ROBOT_NAMES[r]);
-            for(int t=1;t<(int)segs[r].size();t++) cand[r].push_back(segs[r][t]);
+    set<int> conf;
+    vector<vector<pair<int,int>>> best;
+
+    for(int att=0;att<MAX_REPLAN_ATTEMPTS;att++){
+        vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+        for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(cp[r]);
+        rebuildCellLastReserved();
+        vector<int> order;
+        if(att==0){
+            set<int> aff2; for(int r=0;r<ROBOTS;r++) if(nr[r]) aff2.insert(r);
+            order=planningOrder(cp,goals,aff2);
+        } else {
+            set<int> rs; for(int r:conf) if(nr[r]) rs.insert(r);
+            vector<int> cv(rs.begin(),rs.end());
+            shuffle(cv.begin(),cv.end(),default_random_engine((unsigned)(time(0)+(unsigned)att*999983u)));
+            auto rest=planningOrder(cp,goals,rs);
+            order=cv; for(int r:rest) order.push_back(r);
         }
-        int len=0;
-        for(auto&p:cand) len=max(len,(int)p.size());
+        vector<vector<pair<int,int>>> ns(ROBOTS);
+        for(int r:order){
+            if(cp[r]==goals[r]||!nr[r]) continue;
+            bool onObs=(grid[cp[r].first][cp[r].second]==1);
+            ns[r]=timeExpandedAStar(cp[r],goals[r],onObs);
+            if((int)ns[r].size()<=1){
+                if(!coopYield(r,onObs,ns,cp,goals,verbose&&att==0)){
+                    ns[r]={cp[r]}; for(int i=0;i<3;i++) ns[r].push_back(cp[r]);
+                }
+            }
+            reservePath(ns[r]);
+        }
         for(int r=0;r<ROBOTS;r++){
-            while((int)cand[r].size()<len){
-                auto last=cand[r].back();
-                if(last==goals[r]){ cand[r].push_back(last); continue; }
-                if((int)cand[r].size()>=2){
-                    auto prev=cand[r][cand[r].size()-2];
-                    if(prev!=last&&validCell(prev.first,prev.second)){
-                        cand[r].push_back(prev); continue;
+            if(cp[r]==goals[r]){
+                ns[r]={cp[r]}; for(int i=0;i<GOAL_HOLD_STEPS;i++) ns[r].push_back(cp[r]);
+                reservePath(ns[r]); continue;
+            }
+            if(nr[r]) continue;
+            ns[r].clear();
+            for(int t=fromStep;t<(int)paths[r].size();t++) ns[r].push_back(paths[r][t]);
+            reservePath(ns[r]);
+        }
+        auto cand=assembleAndReserve(fromStep,paths,ns,goals);
+        auto cr=detectCollisions(cand,fromStep,-1,false);
+        if(!cr.hasCollision){
+            paths=cand; maxLen=(int)cand[0].size();
+            if(verbose) printf(" CF(att%d) maxLen=%d\n=== REPLAN done ===\n\n",att+1,maxLen);
+            return;
+        }
+        for(int r:cr.affectedRobots){conf.insert(r); nr[r]=true;}
+        if(best.empty()) best=ns;
+    }
+
+    // Yield pass
+    vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+    for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(cp[r]);
+    rebuildCellLastReserved();
+    vector<vector<pair<int,int>>> fs(ROBOTS);
+    auto fo=planningOrder(cp,goals);
+    for(int r:fo){
+        if(cp[r]==goals[r]||!nr[r]) continue;
+        bool onObs=(grid[cp[r].first][cp[r].second]==1);
+        fs[r]=timeExpandedAStar(cp[r],goals[r],onObs);
+        if((int)fs[r].size()<=1){
+            if(!coopYield(r,onObs,fs,cp,goals,verbose)){
+                fs[r]={cp[r]}; for(int i=0;i<3;i++) fs[r].push_back(cp[r]);
+            }
+        }
+        reservePath(fs[r]);
+    }
+    for(int r:fo){
+        if(cp[r]==goals[r]){
+            fs[r]={cp[r]}; for(int i=0;i<GOAL_HOLD_STEPS;i++) fs[r].push_back(cp[r]);
+            reservePath(fs[r]); continue;
+        }
+        if(nr[r]) continue;
+        fs[r].clear(); for(int t=fromStep;t<(int)paths[r].size();t++) fs[r].push_back(paths[r][t]);
+        reservePath(fs[r]);
+    }
+    resolveYield(fromStep,goals,cp,fs,verbose);
+    auto fc=assembleAndReserve(fromStep,paths,fs,goals);
+    if(!detectCollisions(fc,fromStep,-1,false).hasCollision){
+        paths=fc; maxLen=(int)fc[0].size();
+        if(verbose) printf(" CF(yield) maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
+        return;
+    }
+
+    // Extended search
+    int ext=min(MAX_TIME*2,MAX_TIME+120);
+    vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+    for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(cp[r]);
+    rebuildCellLastReserved();
+    vector<vector<pair<int,int>>> xs(ROBOTS);
+    for(int r=0;r<ROBOTS;r++){
+        bool onObs=(grid[cp[r].first][cp[r].second]==1);
+        xs[r]=timeExpandedAStar(cp[r],goals[r],onObs,ext);
+        if((int)xs[r].size()<=1){xs[r]={cp[r]}; for(int i=0;i<3;i++) xs[r].push_back(cp[r]);}
+        reservePath(xs[r]);
+    }
+    auto xc=assembleAndReserve(fromStep,paths,xs,goals);
+    if(!detectCollisions(xc,fromStep,-1,false).hasCollision){
+        paths=xc; maxLen=(int)xc[0].size();
+        if(verbose) printf(" CF(ext) maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
+        return;
+    }
+    if(!best.empty()){
+        auto bc=assembleAndReserve(fromStep,paths,best,goals);
+        if(!detectCollisions(bc,fromStep,-1,false).hasCollision){
+            paths=bc; maxLen=(int)bc[0].size(); return;
+        }
+    }
+    if(!detectCollisions(origPaths,fromStep,-1,false).hasCollision){
+        paths=origPaths; maxLen=(int)origPaths[0].size(); return;
+    }
+    if(verbose) printf(" [REPLAN FAILED]\n");
+}
+
+static void resolveYield(int,const vector<pair<int,int>>&goals,
+                         const vector<pair<int,int>>&cur,
+                         vector<vector<pair<int,int>>>&ns,bool verbose){
+    for(int pass=0;pass<ROBOTS;pass++){
+        bool anyStuck=false;
+        for(int s=0;s<ROBOTS;s++){
+            if(cur[s]==goals[s]||(int)ns[s].size()>1) continue;
+            anyStuck=true;
+            if(grid[cur[s].first][cur[s].second]==1){
+                ns[s]={cur[s]};
+                pair<int,int> ss=cur[s];
+                for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
+                    int nx=ss.first+dx,ny=ss.second+dy;
+                    if(nx>=0&&ny>=0&&nx<ROWS&&ny<COLS&&validCell(nx,ny)&&!vertexRes[1].count({nx,ny})){
+                        ss={nx,ny}; break;
                     }
                 }
-                auto ss=findSideStep(last,goals[r],(int)cand[r].size()%MAX_TIME);
-                cand[r].push_back(ss);
+                for(int i=0;i<YIELD_WAIT_STEPS;i++) ns[s].push_back(ss);
+                reservePath(ns[s]); continue;
             }
-        }
-        return cand;
-    };
-
-    auto buildYieldPath=[&](pair<int,int> goalCell,pair<int,int> yieldCell,
-                             int stuckDist) -> vector<pair<int,int>> {
-        int window = max(1, min(3, stuckDist));
-        vector<pair<int,int>> yp;
-        yp.push_back(goalCell);
-        for(int i=0;i<window;i++) yp.push_back(yieldCell);
-        yp.push_back(goalCell);
-        return yp;
-    };
-
-    auto tryCoopYield=[&](int r,bool onObs,
-                          vector<vector<pair<int,int>>>& segs,
-                          bool loud) -> bool {
-        for(int blocker=0; blocker<ROBOTS; blocker++){
-            if(blocker==r) continue;
-            if(segs[blocker].empty()) continue;
-            if(curPos[blocker]!=goals[blocker]) continue;
-            erasePathReservations(segs[blocker]);
-            auto testPath=timeExpandedAStar(curPos[r],goals[r],onObs);
-            if((int)testPath.size()<=1){ reservePath(segs[blocker]); continue; }
-            pair<int,int> yieldCell={-1,-1};
-            for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
-                int nx=goals[blocker].first+dx, ny=goals[blocker].second+dy;
-                if(!validCell(nx,ny)||vertexRes[1].count({nx,ny})) continue;
-                yieldCell={nx,ny}; break;
-            }
-            if(yieldCell.first==-1){ reservePath(segs[blocker]); continue; }
-            int dist=abs(curPos[r].first-goals[blocker].first)
-                    +abs(curPos[r].second-goals[blocker].second);
-            auto yp=buildYieldPath(goals[blocker],yieldCell,dist);
-            segs[blocker]=yp;
-            reservePath(yp);
-            segs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
-            if((int)segs[r].size()>1){
-                if(loud) printf(" [COOP-YIELD] %s steps aside (%d steps) for %s\n",
-                               ROBOT_NAMES[blocker],(int)yp.size()-2,ROBOT_NAMES[r]);
-                return true;
-            }
-            erasePathReservations(yp);
-            segs[blocker]={goals[blocker]};
-            reservePath(segs[blocker]);
-            segs[r]={curPos[r]};
-        }
-        return false;
-    };
-
-    set<int> conflictedRobots;
-    vector<vector<pair<int,int>>> bestSegs;
-
-    for(int attempt=0; attempt<MAX_REPLAN_ATTEMPTS; attempt++){
-        vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
-        for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(curPos[r]);
-        rebuildCellLastReserved();
-
-        vector<int> order;
-        if(attempt==0){
-            set<int> affSet;
-            for(int r=0;r<ROBOTS;r++) if(needsRepath[r]) affSet.insert(r);
-            order=planningOrder(curPos,goals,affSet);
-        } else {
-            set<int> retrySet;
-            for(int r:conflictedRobots) if(needsRepath[r]) retrySet.insert(r);
-            vector<int> cv(retrySet.begin(),retrySet.end());
-            unsigned seed=(unsigned)(time(0)+attempt*999983);
-            shuffle(cv.begin(),cv.end(),default_random_engine(seed));
-            set<int> cs(retrySet.begin(),retrySet.end());
-            vector<int> rest=planningOrder(curPos,goals,cs);
-            order=cv;
-            for(int r:rest) order.push_back(r);
-        }
-
-        if(verbose&&attempt==0){
-            printf(" Order (affected): ");
-            for(int r:order) if(needsRepath[r]) printf("%s ",ROBOT_NAMES[r]);
-            printf("\n");
-        }
-
-        vector<vector<pair<int,int>>> newSegs(ROBOTS);
-
-        for(int r=0;r<ROBOTS;r++){
-            if(curPos[r]==goals[r]){
-                newSegs[r]={curPos[r]};
-                reservePath(newSegs[r]);
-            }
-        }
-
-        for(int r=0;r<ROBOTS;r++){
-            if(curPos[r]==goals[r]) continue;
-            if(!needsRepath[r]){
-                newSegs[r].clear();
-                for(int t=fromStep;t<(int)paths[r].size();t++)
-                    newSegs[r].push_back(paths[r][t]);
-                reservePath(newSegs[r]);
-            }
-        }
-
-        for(int r:order){
-            if(curPos[r]==goals[r]) continue;
-            if(!needsRepath[r]) continue;
-
-            bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
-            newSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
-
-            if((int)newSegs[r].size()<=1){
-                bool ok=tryCoopYield(r,onObs,newSegs,verbose&&attempt==0);
-                if(!ok){
-                    if(verbose&&attempt==0)
-                        printf(" [STUCK L1] %s at (%d,%d) — no path found\n",
-                               ROBOT_NAMES[r],curPos[r].first,curPos[r].second);
-                    newSegs[r]={curPos[r]};
-                    for(int i=0;i<3;i++) newSegs[r].push_back(curPos[r]);
+            bool res=false;
+            for(int b=0;b<ROBOTS&&!res;b++){
+                if(b==s||cur[b]!=goals[b]) continue;
+                erasePathReservations(ns[b]);
+                auto tp=timeExpandedAStar(cur[s],goals[s],false);
+                if((int)tp.size()<=1){
+                    ns[b]={goals[b]}; for(int i=0;i<GOAL_HOLD_STEPS;i++) ns[b].push_back(goals[b]);
+                    reservePath(ns[b]); continue;
                 }
+                pair<int,int> yc={-1,-1};
+                for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
+                    int nx=goals[b].first+dx,ny=goals[b].second+dy;
+                    if(!validCell(nx,ny)||vertexRes[1].count({nx,ny})) continue;
+                    yc={nx,ny}; break;
+                }
+                if(yc.first==-1){
+                    ns[b]={goals[b]}; for(int i=0;i<GOAL_HOLD_STEPS;i++) ns[b].push_back(goals[b]);
+                    reservePath(ns[b]); continue;
+                }
+                vector<pair<int,int>> yp={goals[b],yc};
+                for(int i=0;i<YIELD_WAIT_STEPS;i++) yp.push_back(yc);
+                yp.push_back(goals[b]);
+                ns[b]=yp; reservePath(yp);
+                ns[s]=timeExpandedAStar(cur[s],goals[s],false);
+                if((int)ns[s].size()>1){reservePath(ns[s]); res=true;}
+                else{erasePathReservations(yp); ns[b]={goals[b]}; reservePath(ns[b]);}
             }
-            reservePath(newSegs[r]);
-        }
-
-        auto cand=assemblePaths(newSegs);
-        auto cr=detectCollisions(cand,fromStep,false);
-
-        if(!cr.hasCollision){
-            paths=cand;
-            maxLen=(int)cand[0].size();
-            if(verbose){
-                printf(" Validation:\n");
-                for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],fromStep,verbose);
-                printf(" COLLISION-FREE (attempt %d/%d)\n",attempt+1,MAX_REPLAN_ATTEMPTS);
-                printf(" maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
-            }
-            return;
-        }
-
-        for(int r:cr.affectedRobots){
-            conflictedRobots.insert(r);
-            needsRepath[r] = true;
-        }
-        if(verbose)
-            printf(" [attempt %d/%d] %s — retrying...\n",
-                   attempt+1,MAX_REPLAN_ATTEMPTS,cr.description.c_str());
-        if(bestSegs.empty()) bestSegs=newSegs;
-    }
-
-    if(verbose)
-        printf(" [YIELD PASS] All %d attempts collided — trying yield...\n",
-               MAX_REPLAN_ATTEMPTS);
-
-    vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
-    for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(curPos[r]);
-    rebuildCellLastReserved();
-
-    vector<int> finalOrder=planningOrder(curPos,goals);
-    vector<vector<pair<int,int>>> finalSegs(ROBOTS);
-
-    for(int r=0;r<ROBOTS;r++){
-        if(curPos[r]==goals[r]){
-            finalSegs[r]={curPos[r]};
-            reservePath(finalSegs[r]);
-        }
-    }
-
-    for(int r=0;r<ROBOTS;r++){
-        if(curPos[r]==goals[r]) continue;
-        if(!needsRepath[r]) continue;
-        finalSegs[r].clear();
-        for(int t=fromStep;t<(int)paths[r].size();t++)
-            finalSegs[r].push_back(paths[r][t]);
-        reservePath(finalSegs[r]);
-    }
-
-    for(int r:finalOrder){
-        if(curPos[r]==goals[r]) continue;
-        if(!needsRepath[r]) continue;
-        bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
-        finalSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs);
-        if((int)finalSegs[r].size()<=1){
-            bool ok=tryCoopYield(r,onObs,finalSegs,verbose);
-            if(!ok){
-                finalSegs[r]={curPos[r]};
-                for(int i=0;i<3;i++) finalSegs[r].push_back(curPos[r]);
+            if(!res){
+                ns[s]={cur[s]}; for(int i=0;i<YIELD_WAIT_STEPS;i++) ns[s].push_back(cur[s]);
+                reservePath(ns[s]);
             }
         }
-        reservePath(finalSegs[r]);
+        if(!anyStuck) break;
     }
-
-    resolveYield(fromStep,goals,curPos,finalSegs,verbose);
-
-    auto finalCand=assemblePaths(finalSegs);
-    auto finalCr=detectCollisions(finalCand,fromStep,false);
-
-    if(!finalCr.hasCollision){
-        paths=finalCand;
-        maxLen=(int)finalCand[0].size();
-        if(verbose){
-            printf(" Validation:\n");
-            for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],fromStep,verbose);
-            printf(" COLLISION-FREE (after yield pass)\n");
-            printf(" maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
-        }
-        return;
-    }
-
-    if(verbose){
-        printf(" [WARNING] Residual collision after yield: %s\n",
-               finalCr.description.c_str());
-        printf(" Attempting full replan with extended horizon...\n");
-    }
-
-    int extendedHorizon = min(MAX_TIME*2, MAX_TIME + 100);
-
-    vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
-    for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(curPos[r]);
-    rebuildCellLastReserved();
-
-    vector<vector<pair<int,int>>> fullSegs(ROBOTS);
-    vector<int> fullOrder = planningOrder(curPos,goals);
-
-    for(int r=0;r<ROBOTS;r++){
-        bool onObs=(grid[curPos[r].first][curPos[r].second]==1);
-        fullSegs[r]=timeExpandedAStar(curPos[r],goals[r],onObs,extendedHorizon);
-        if((int)fullSegs[r].size()<=1){
-            fullSegs[r]={curPos[r]};
-            for(int i=0;i<3;i++) fullSegs[r].push_back(curPos[r]);
-        }
-        reservePath(fullSegs[r]);
-    }
-
-    auto fullCand=assemblePaths(fullSegs);
-    auto fullCr=detectCollisions(fullCand,fromStep,false);
-
-    if(!fullCr.hasCollision){
-        paths=fullCand;
-        maxLen=(int)fullCand[0].size();
-        if(verbose){
-            printf(" Validation:\n");
-            for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],fromStep,verbose);
-            printf(" COLLISION-FREE (after full replan)\n");
-            printf(" maxLen=%d\n=== REPLAN done ===\n\n",maxLen);
-        }
-        return;
-    }
-
-    if(verbose){
-        printf(" [REPLAN FAILED] full replan still colliding: %s\n", fullCr.description.c_str());
-        printf(" Reverting to previous plan where possible.\n");
-    }
-
-    auto bestCand = assemblePaths(bestSegs);
-    auto bestCr = detectCollisions(bestCand,fromStep,false);
-    if(!bestSegs.empty() && !bestCr.hasCollision){
-        paths = bestCand;
-        maxLen=(int)bestCand[0].size();
-        if(verbose){
-            printf(" Recovered using best candidate (collision-free)\n");
-        }
-        return;
-    }
-
-    if(!originalPaths.empty()){
-        auto origCr = detectCollisions(originalPaths,fromStep,false);
-        if(!origCr.hasCollision){
-            paths = originalPaths;
-            maxLen = (int)originalPaths[0].size();
-            if(verbose) printf(" Reverted to original paths (collision-free)\n");
-            return;
-        }
-    }
-
-    if(verbose) printf(" No collision-free replan found; leaving paths unchanged.\n");
 }
 
-bool lookaheadBlocked(int step,const vector<vector<pair<int,int>>>& paths,
-                      bool verbose=false)
-{
-    int ml=(int)paths[0].size();
-    for(int r=0;r<ROBOTS;r++){
-        for(int ahead=0;ahead<=LOOKAHEAD;ahead++){
-            int t=min(step+ahead,ml-1);
-            auto[x,y]=paths[r][t];
-            if(grid[x][y]==1){
-                if(verbose) printf("[LOOKAHEAD] %s step+%d will hit obstacle\n",
-                                   ROBOT_NAMES[r],ahead);
-                return true;
-            }
+static bool coopYield(int r,bool onObs,vector<vector<pair<int,int>>>&segs,
+                      const vector<pair<int,int>>&cp,
+                      const vector<pair<int,int>>&goals,bool verbose){
+    for(int b=0;b<ROBOTS;b++){
+        if(b==r||segs[b].empty()||cp[b]!=goals[b]) continue;
+        erasePathReservations(segs[b]);
+        auto tp=timeExpandedAStar(cp[r],goals[r],onObs);
+        if((int)tp.size()<=1){
+            segs[b]={goals[b]}; for(int i=0;i<GOAL_HOLD_STEPS;i++) segs[b].push_back(goals[b]);
+            reservePath(segs[b]); continue;
         }
+        pair<int,int> yc={-1,-1};
+        for(auto[dx,dy]:vector<pair<int,int>>{{1,0},{-1,0},{0,1},{0,-1}}){
+            int nx=goals[b].first+dx,ny=goals[b].second+dy;
+            if(!validCell(nx,ny)||vertexRes[1].count({nx,ny})) continue;
+            yc={nx,ny}; break;
+        }
+        if(yc.first==-1){
+            segs[b]={goals[b]}; for(int i=0;i<GOAL_HOLD_STEPS;i++) segs[b].push_back(goals[b]);
+            reservePath(segs[b]); continue;
+        }
+        int wd=abs(cp[r].first-goals[b].first)+abs(cp[r].second-goals[b].second);
+        int w=max(1,min(3,wd));
+        vector<pair<int,int>> yp={goals[b]}; for(int i=0;i<w;i++) yp.push_back(yc);
+        yp.push_back(goals[b]);
+        segs[b]=yp; reservePath(yp);
+        segs[r]=timeExpandedAStar(cp[r],goals[r],onObs);
+        if((int)segs[r].size()>1){
+            if(verbose) printf(" [COOP-YIELD] %s->%s\n",ROBOT_NAMES[b],ROBOT_NAMES[r]);
+            return true;
+        }
+        erasePathReservations(yp); segs[b]={goals[b]}; reservePath(segs[b]); segs[r]={cp[r]};
     }
     return false;
 }
 
-bool isRobotAt(int x,int y,int step,
-               const vector<vector<pair<int,int>>>& paths,bool sim)
-{
-    if(!sim) return false;
+static bool lookaheadBlocked(int step,const vector<vector<pair<int,int>>>&paths){
+    int ml=(int)paths[0].size();
+    for(int r=0;r<ROBOTS;r++)
+        for(int a=0;a<=LOOKAHEAD;a++){
+            int t=min(step+a,ml-1);
+            auto[x,y]=paths[r][t];
+            if(grid[x][y]==1) return true;
+        }
+    return false;
+}
+static bool isRobotAt(int x,int y,int step,const vector<vector<pair<int,int>>>&paths){
     for(int r=0;r<ROBOTS;r++){
         int t=min(step,(int)paths[r].size()-1);
         if(paths[r][t].first==x&&paths[r][t].second==y) return true;
@@ -807,459 +802,293 @@ bool isRobotAt(int x,int y,int step,
     return false;
 }
 
-void renderRobot(int r,float px,float py,float ang,
-                 pair<int,int> cur,pair<int,int> goal,
-                 const vector<pair<int,int>>& paths_r,
-                 Color col)
-{
-    bool atGoal    =(cur==goal);
-    bool trulyStuck=((int)paths_r.size()<=1&&!atGoal);
-    if(trulyStuck)
-        DrawRectangleLinesEx({px-CELL*0.38f,py-CELL*0.28f,CELL*0.76f,CELL*0.56f},3,RED);
-    DrawRectanglePro({px-CELL*0.3f,py-CELL*0.2f,CELL*0.6f,CELL*0.4f},
-                     {CELL*0.3f,CELL*0.2f},ang,col);
-    string lbl="R"+to_string(r); int fs=18;
-    DrawText(lbl.c_str(),(int)(px-MeasureText(lbl.c_str(),fs)/2.f),(int)(py-fs/2.f),fs,BLACK);
-    DrawText(("("+to_string(cur.first)+","+to_string(cur.second)+")").c_str(),
-             (int)(px-20),(int)(py+14),12,BLACK);
+/* ================================================================ RENDER */
+static void renderRobot(int r,float px,float py,float ang,
+                        pair<int,int> cur,pair<int,int> goal,
+                        const vector<pair<int,int>>&pr,
+                        const RobotBehavior&rb,Color col){
+    bool stuck=((int)pr.size()<=1&&cur!=goal);
+    if(stuck) DrawRectangleLinesEx({px-CELL*0.38f,py-CELL*0.28f,CELL*0.76f,CELL*0.56f},3,RED);
+    DrawRectanglePro({px-CELL*0.3f,py-CELL*0.2f,CELL*0.6f,CELL*0.4f},{CELL*0.3f,CELL*0.2f},ang,col);
+    string lbl="R"+to_string(r);
+    int fs=16;
+    DrawText(lbl.c_str(),(int)(px-MeasureText(lbl.c_str(),fs)/2.f),(int)(py-fs/2.f-2),fs,BLACK);
+    DrawText(("("+to_string(cur.first)+","+to_string(cur.second)+")").c_str(),(int)(px-22),(int)(py+11),10,BLACK);
+    string info=string(decisionName(rb.lastDecision))+" W:"+to_string(rb.waitCount)+" D:"+to_string(rb.deviationCells);
+    DrawText(info.c_str(),(int)(px-MeasureText(info.c_str(),8)/2.f),(int)(py+22),8,DARKBLUE);
 }
 
-// ─── shared helper: place, replan, and trigger flash ─────────────────────────
-// Returns true if an obstacle was actually placed.
-// Advances lastObsTime unconditionally so the timer is never "stuck".
-bool tryPlaceObs(
-    int ROWS, int COLS,
-    int& obsPlaced,
-    vector<pair<int,int>>& obstacles,
-    const function<bool(int,int)>& isProtected,
-    const function<bool(int,int)>& isRobotHere,
-    int step,
-    bool simStarted, bool pathsReady,
-    int& lastReplanStep,
-    vector<vector<pair<int,int>>>& paths, int& maxLen,
-    const vector<pair<int,int>>& goals,
-    double now, double& lastObsTime,
-    bool& replanFlash, double& replanFlashTime, double& lastStepTime)
-{
-    lastObsTime = now;   // always advance — prevents hammering on failure
-    for(int att = 0; att < 1000; att++){
-        int x = rand()%ROWS, y = rand()%COLS;
-        if(grid[x][y]==0 && !isProtected(x,y) && !isRobotHere(x,y)){
-            grid[x][y]=1; obstacles.push_back({x,y}); obsPlaced++;
-            printf("[OBS #%d] placed at (%d,%d)\n", obsPlaced, x, y);
-            if(simStarted && pathsReady && lastReplanStep != step){
-                replanAll(step, goals, paths, maxLen, true);
-                lastReplanStep = step;
-                replanFlash = true; replanFlashTime = now;
-                lastStepTime = now;
-            }
+static void printRethink(const vector<RobotBehavior>&robots){
+    printf("\n+----------------------------------------------+\n");
+    printf("|   FINAL STATS (all bugs fixed edition)      |\n");
+    printf("+----------------------------------------------+\n");
+    for(auto&rb:robots) rb.printStats();
+    int tw=0,tbw=0,td=0;
+    for(auto&rb:robots){tw+=rb.waitCount;tbw+=rb.behavWaitCount;td+=rb.deviationCells;}
+    printf("  TOTALS  waits=%d(behav=%d)  deviation=%d\n",tw,tbw,td);
+    printf("+----------------------------------------------+\n\n");
+}
+
+/* ================================================================ OBS HELPERS */
+// [BUG-OBS-TIMING FIX] always calls replanAll(forceAll=true) — no guard
+static bool tryPlaceObs(int&opc,vector<pair<int,int>>&obs,
+        const function<bool(int,int)>&prot,const function<bool(int,int)>&rob,
+        int step,vector<vector<pair<int,int>>>&paths,int&ml,
+        const vector<pair<int,int>>&goals,bool verbose){
+    for(int a=0;a<3000;a++){
+        int x=rand()%ROWS,y=rand()%COLS;
+        if(grid[x][y]==0&&!prot(x,y)&&!rob(x,y)){
+            grid[x][y]=1; obs.push_back({x,y}); opc++;
+            printf("[OBS #%d] at (%d,%d) step=%d\n",opc,x,y,step);
+            replanAll(step,goals,paths,ml,verbose,true);
             return true;
         }
     }
-    printf("[OBS] No free cell found for obstacle #%d — skipping\n", obsPlaced+1);
-    return false;
+    printf("[OBS] no free cell\n"); return false;
 }
-
-// ─── shared helper: relocate one obstacle ────────────────────────────────────
-void tryRelocObs(
-    int ROWS, int COLS,
-    int& relocCount,
-    vector<pair<int,int>>& obstacles,
-    const function<bool(int,int)>& isProtected,
-    const function<bool(int,int)>& isRobotHere,
-    int step,
-    int& lastReplanStep,
-    vector<vector<pair<int,int>>>& paths, int& maxLen,
-    const vector<pair<int,int>>& goals,
-    double now,
-    bool& replanFlash, double& replanFlashTime, double& lastStepTime,
-    double& relocTriggerTime)
-{
-    int idx = relocCount % (int)obstacles.size();
-    auto oldPos = obstacles[idx];
-    printf("\n[RELOC #%d] (%d,%d) -> ", relocCount, oldPos.first, oldPos.second);
-    grid[oldPos.first][oldPos.second] = 0;
-    bool moved = false;
-    for(int att = 0; att < 1000; att++){
-        int nx = rand()%ROWS, ny = rand()%COLS;
-        if((nx!=oldPos.first||ny!=oldPos.second) &&
-           grid[nx][ny]==0 && !isProtected(nx,ny) && !isRobotHere(nx,ny)){
-            grid[nx][ny]=1; obstacles[idx]={nx,ny};
-            printf("(%d,%d)\n", nx, ny);
-            moved = true; break;
+static void tryRelocObs(int&rc,vector<pair<int,int>>&obs,
+        const function<bool(int,int)>&prot,const function<bool(int,int)>&rob,
+        int step,vector<vector<pair<int,int>>>&paths,int&ml,
+        const vector<pair<int,int>>&goals,bool verbose){
+    int idx=rc%(int)obs.size();
+    auto old=obs[idx];
+    printf("\n[RELOC #%d] (%d,%d)->",rc,old.first,old.second);
+    grid[old.first][old.second]=0;
+    bool moved=false;
+    for(int a=0;a<3000;a++){
+        int nx=rand()%ROWS,ny=rand()%COLS;
+        if((nx!=old.first||ny!=old.second)&&grid[nx][ny]==0&&!prot(nx,ny)&&!rob(nx,ny)){
+            grid[nx][ny]=1; obs[idx]={nx,ny};
+            printf("(%d,%d)\n",nx,ny); moved=true; break;
         }
     }
-    if(!moved){ grid[oldPos.first][oldPos.second]=1; printf("kept (no free cell)\n"); }
-    if(lastReplanStep != step){
-        replanAll(step, goals, paths, maxLen, true);
-        lastReplanStep = step;
-        replanFlash = true; replanFlashTime = now;
-        lastStepTime = now;
-    }
-    relocCount++;
-    relocTriggerTime = now;
+    if(!moved){grid[old.first][old.second]=1; printf("kept\n");}
+    replanAll(step,goals,paths,ml,verbose,true);
+    rc++;
 }
 
+/* ================================================================ MAIN */
 int main(){
-    srand(time(0));
-    vector<pair<int,int>> start={{0,1},{0,2},{0,3},{0,4},{1,0},{2,0},{3,0},{4,0}};
-    vector<pair<int,int>> goal ={{5,1},{5,2},{5,3},{5,4},{1,5},{2,5},{3,5},{4,5}};
-
-    auto isProtectedStatic=[&](int x,int y){
-        for(auto&s:start) if(s.first==x&&s.second==y) return true;
-        for(auto&g:goal)  if(g.first==x&&g.second==y) return true;
+    srand((unsigned)time(nullptr));
+    vector<pair<int,int>> startPos={
+        {0,1},{0,2},{0,3},{0,4},
+        {1,0},{2,0},{3,0},{4,0}
+    };
+    vector<pair<int,int>> goalPos={
+        {5,1},{5,2},{5,3},{5,4},
+        {1,5},{2,5},{3,5},{4,5}
+    };
+    auto isProtSt=[&](int x,int y){
+        for(auto&s:startPos) if(s.first==x&&s.second==y) return true;
+        for(auto&g:goalPos)  if(g.first==x&&g.second==y) return true;
+        if((x==0&&y==0)||(x==0&&y==COLS-1)||
+           (x==ROWS-1&&y==0)||(x==ROWS-1&&y==COLS-1)) return true;
         return false;
     };
-
     for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++) grid[i][j]=0;
 
-    int mode,n;
-    printf("Enter mode (1=static, 2=dynamic, 3=random-goals): "); scanf("%d",&mode);
-    printf("Enter number of obstacles: ");        scanf("%d",&n);
+    int modeInput,n;
+    printf("Enter mode (1=dynamic obstacles+relocate, 2=random-goals+dynamic): ");
+    scanf("%d",&modeInput);
+    printf("Enter number of obstacles: ");
+    scanf("%d",&n);
+    n=max(0,n);
 
-    InitWindow(COLS*CELL,ROWS*CELL+40,"Multi-Robot Pathfinding (No Collisions)");
+    InitWindow(COLS*CELL,ROWS*CELL+60,"Multi-Robot Pathfinding (Fixed)");
     SetTargetFPS(60);
     Color colors[ROBOTS]={RED,BLUE,GREEN,ORANGE,PURPLE,BROWN,DARKGREEN,MAROON};
     vector<pair<int,int>> obstacles;
 
-    auto doInitialPlan=[&](vector<vector<pair<int,int>>>& paths,
-                           int& maxLen,
-                           const vector<pair<int,int>>& curGoal){
-        printf("\n--- Initial planning ---\n");
-        vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
-        for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(start[r]);
-        rebuildCellLastReserved();
+    auto runSim=[&](vector<pair<int,int>>&cg,int modeLabel){
+        // [BUG-OBS FIX] Compute interval so ALL n obstacles fire inside
+        // the first OBS_END_FRAC fraction of the estimated simulation window.
+        double simWindow=EST_SIM_STEPS*TPS*OBS_END_FRAC; // seconds
+        double obsInterval=(n>0)?(simWindow/n):999999.0;
+        obsInterval=max(2.5,obsInterval); // never faster than one every 2.5 s
+        // Obstacle i fires when simElapsed >= (i+1)*obsInterval  (i=0..n-1)
+        int obsPlaced=0;
+        double nextRelocAt=simWindow+5.0;
+        int rc=0;
 
-        auto order=planningOrder(start,curGoal);
-        printf(" Order: ");
-        for(int r:order) printf("%s ",ROBOT_NAMES[r]);
-        printf("\n");
+        double wallStart=GetTime(), simStart=0.0;
+        bool started=false;
+        int step=0, maxLen=1;
+        bool ready=false;
+        int lbh=-1, lp=-1;
+        bool finalPrinted=false, origFrozen=false;
+        int lastObsReplanStep=-1;
+        bool replanFlash=false; double replanFlashT=0.0;
 
-        for(int r:order){
-            bool atGoal=(start[r]==curGoal[r]);
-            if(atGoal) paths[r]={start[r]};
-            else paths[r]=timeExpandedAStar(start[r],curGoal[r],false);
-            reservePath(paths[r]);
-            printf(" %s: %d steps\n",ROBOT_NAMES[r],(int)paths[r].size());
-        }
-        maxLen=0;
-        for(auto&p:paths) maxLen=max(maxLen,(int)p.size());
+        double prevFrameT=GetTime();
+        float stepFrac=0.f;
 
-        for(int r=0;r<ROBOTS;r++){
-            while((int)paths[r].size()<maxLen){
-                auto last=paths[r].back();
-                if(last==curGoal[r]){
-                    paths[r].push_back(last);
-                    continue;
+        vector<vector<pair<int,int>>> paths(ROBOTS);
+        vector<RobotBehavior> robots;
+        for(int r=0;r<ROBOTS;r++) robots.emplace_back(r,startPos[r],cg[r]);
+
+        auto isRH=[&](int x,int y)->bool{return isRobotAt(x,y,step,paths);};
+        auto isPr=[&](int x,int y){return isProtSt(x,y);};
+
+        printf("\n=== MODE %d : %d obstacles ===\n",modeLabel,n);
+        if(n>0) printf("    obsInterval=%.2fs  window=%.2fs\n",obsInterval,simWindow);
+
+        while(!WindowShouldClose()){
+            double now=GetTime();
+            float dt=(float)(now-prevFrameT);
+            prevFrameT=now;
+            dt=min(dt,0.1f);
+
+            if(!started&&now-wallStart>=SIM_START_DELAY){
+                started=true; simStart=now;
+                vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+                for(int r=0;r<ROBOTS;r++) vertexRes[0].insert(startPos[r]);
+                rebuildCellLastReserved();
+                for(int r=0;r<ROBOTS;r++){
+                    paths[r]=timeExpandedAStar(startPos[r],cg[r],false);
+                    reservePath(paths[r]);
                 }
-                if((int)paths[r].size()>=2){
-                    auto prev=paths[r][paths[r].size()-2];
-                    if(prev!=last&&validCell(prev.first,prev.second)){
-                        paths[r].push_back(prev); continue;
+                maxLen=0;
+                for(auto&p:paths) maxLen=max(maxLen,(int)p.size());
+                for(auto&p:paths) while((int)p.size()<maxLen) p.push_back(p.back());
+                vertexRes.clear(); edgeRes.clear(); cellLastReserved.clear();
+                for(int r=0;r<ROBOTS;r++) reservePath(paths[r]);
+                ready=true; stepFrac=0.f;
+            }
+
+            if(started&&ready){
+                double simElapsed=now-simStart;
+
+                // [BUG-OBS FIX] fire obstacle i when elapsed >= (i+1)*interval
+                if(obsPlaced<n && simElapsed>=(obsPlaced+1)*obsInterval){
+                    tryPlaceObs(obsPlaced,obstacles,isPr,isRH,
+                                step,paths,maxLen,cg,false);
+                    lastObsReplanStep=step; // suppress redundant lookahead this step
+                    replanFlash=true; replanFlashT=now;
+                }
+                // Relocate after all placed
+                if(obsPlaced>=n&&n>0&&!obstacles.empty()&&simElapsed>=nextRelocAt){
+                    tryRelocObs(rc,obstacles,isPr,isRH,step,paths,maxLen,cg,false);
+                    nextRelocAt=simElapsed+12.0;
+                    lastObsReplanStep=step;
+                    replanFlash=true; replanFlashT=now;
+                }
+                // [BUG-OBS-TIMING FIX] lookahead fires only when no placement this step
+                if(lastObsReplanStep!=step&&lookaheadBlocked(step,paths)){
+                    replanAll(step,cg,paths,maxLen,false,true);
+                    lastObsReplanStep=step;
+                    replanFlash=true; replanFlashT=now;
+                }
+                // Behavior once per logical step
+                if(step!=lbh){
+                    resolveConflicts(step,paths,cg,robots,maxLen,false);
+                    lbh=step;
+                    if(!origFrozen){
+                        for(int r=0;r<ROBOTS;r++) robots[r].setOriginalPath(paths[r]);
+                        origFrozen=true;
                     }
                 }
-                auto ss=findSideStep(last,curGoal[r],(int)paths[r].size()%MAX_TIME);
-                paths[r].push_back(ss);
-            }
-        }
-
-        printf(" maxLen=%d\nValidation:\n",maxLen);
-        for(int r=0;r<ROBOTS;r++) validatePath(r,paths[r],0);
-        auto cr=detectCollisions(paths,0,true);
-        if(!cr.hasCollision) printf(" COLLISION-FREE\n");
-        else                 printf(" WARNING: collisions detected\n");
-    };
-
-    if(mode==1){
-        int placed=0;
-        while(placed<n){
-            int x=rand()%ROWS,y=rand()%COLS;
-            if(grid[x][y]==0&&!isProtectedStatic(x,y)){
-                grid[x][y]=1; obstacles.push_back({x,y}); placed++;
-            }
-        }
-        printf("\n=== MODE 1 : %d static obstacles ===\n",n);
-        vector<vector<pair<int,int>>> paths(ROBOTS);
-        int maxLen=0;
-        doInitialPlan(paths,maxLen,goal);
-
-        const float TIME_PER_STEP=1.5f; const double START_DELAY=5.0;
-        double startTime=GetTime(); int step=0; double lastStep=0;
-        bool started=false,finished=false; int lastPrinted=-1;
-        vector<float> angle(ROBOTS,0),posX(ROBOTS),posY(ROBOTS);
-        for(int i=0;i<ROBOTS;i++){
-            posX[i]=start[i].second*CELL+CELL/2.f;
-            posY[i]=start[i].first*CELL+CELL/2.f;
-        }
-        while(!WindowShouldClose()){
-            double now=GetTime();
-            if(!started&&now-startTime>=START_DELAY){started=true;lastStep=now;}
-            if(started&&!finished&&now-lastStep>=TIME_PER_STEP){
-                if(step<maxLen-1){step++;lastStep=now;}else finished=true;}
-            if(started&&step!=lastPrinted){
-                printSingleStep(step,paths,goal); lastPrinted=step;
-                if(finished) printf("\nAll robots at goals!\n");}
-            BeginDrawing(); ClearBackground(RAYWHITE);
-            for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++){
-                if(grid[i][j]) DrawRectangle(j*CELL,i*CELL,CELL,CELL,DARKGRAY);
-                DrawRectangleLines(j*CELL,i*CELL,CELL,CELL,LIGHTGRAY);}
-            for(int r=0;r<ROBOTS;r++){
-                Color gc=colors[r]; gc.a=60;
-                DrawRectangle(goal[r].second*CELL+2,goal[r].first*CELL+2,CELL-4,CELL-4,gc);
-                DrawText(("G"+to_string(r)).c_str(),goal[r].second*CELL+4,goal[r].first*CELL+4,14,colors[r]);}
-            for(int r=0;r<ROBOTS;r++){
-                auto cur=started?paths[r][step]:start[r];
-                auto nxt=started?paths[r][min(step+1,maxLen-1)]:start[r];
-                float cx=cur.second*CELL+CELL/2.f,cy=cur.first*CELL+CELL/2.f;
-                float nx2=nxt.second*CELL+CELL/2.f,ny2=nxt.first*CELL+CELL/2.f;
-                float alpha=started&&!finished?min(1.f,float((now-lastStep)/TIME_PER_STEP)):0.f;
-                posX[r]=cx+(nx2-cx)*alpha; posY[r]=cy+(ny2-cy)*alpha;
-                if(nxt.first>cur.first) angle[r]=90;
-                else if(nxt.first<cur.first) angle[r]=270;
-                else if(nxt.second>cur.second) angle[r]=0;
-                else if(nxt.second<cur.second) angle[r]=180;
-                renderRobot(r,posX[r],posY[r],angle[r],cur,goal[r],paths[r],colors[r]);}
-            DrawRectangle(0,ROWS*CELL,COLS*CELL,40,Fade(BLACK,0.75f));
-            if(!started)
-                DrawText(("Mode1|Start in "+to_string(max(0,(int)(START_DELAY-(now-startTime))+1))+"s").c_str(),10,ROWS*CELL+10,18,WHITE);
-            else if(finished)
-                DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
-            else
-                DrawText(("Step "+to_string(step)+"/"+to_string(maxLen-1)).c_str(),10,ROWS*CELL+10,18,WHITE);
-            EndDrawing();
-        }
-        CloseWindow(); return 0;
-    }
-
-    // ── MODE 2 ──────────────────────────────────────────────────────────────
-    if(mode==2){
-        // FIX 1: Increased OBS_INTERVAL from 5s to 12s so robots have more
-        //        time to adapt between consecutive obstacle placements.
-        // FIX 2: RELOC_INTERVAL slightly increased for the same reason.
-        const float TIME_PER_STEP  = 1.5f;
-        const double START_DELAY   = 5.0;
-        const double OBS_INTERVAL  = 12.0;   // was 5.0
-        const double RELOC_INTERVAL= 10.0;   // was 8.0
-
-        double wallStart=GetTime();
-        int obsPlaced=0; double lastObsTime=wallStart; bool allObsPlaced=false;
-        bool simStarted=false; double lastStepTime=0.0;
-        int step=0,maxLen=1; bool pathsReady=false;
-        double relocTriggerTime=0.0; int relocCount=0;
-        vector<vector<pair<int,int>>> paths(ROBOTS);
-        vector<float> angle(ROBOTS,0),posX(ROBOTS),posY(ROBOTS);
-        for(int i=0;i<ROBOTS;i++){
-            posX[i]=start[i].second*CELL+CELL/2.f;
-            posY[i]=start[i].first*CELL+CELL/2.f;
-        }
-        bool replanFlash=false; double replanFlashTime=0.0;
-        int lastPrinted=-1,lastReplanStep=-1;
-        printf("\n=== MODE 2 : %d dynamic obstacles ===\n",n);
-
-        // Capture closures for the shared helpers
-        auto isProtected = [&](int x,int y){ return isProtectedStatic(x,y); };
-        auto isRobotHere = [&](int x,int y){ return isRobotAt(x,y,step,paths,simStarted); };
-
-        while(!WindowShouldClose()){
-            double now=GetTime();
-
-            // ── obstacle placement (FIX: lastObsTime always advanced) ────────
-            if(!allObsPlaced && now-lastObsTime >= OBS_INTERVAL){
-                tryPlaceObs(ROWS,COLS,obsPlaced,obstacles,isProtected,isRobotHere,
-                            step,simStarted,pathsReady,lastReplanStep,
-                            paths,maxLen,goal,now,lastObsTime,
-                            replanFlash,replanFlashTime,lastStepTime);
-                if(obsPlaced>=n){ allObsPlaced=true; relocTriggerTime=now; }
-            }
-
-            if(!simStarted&&now-wallStart>=START_DELAY){
-                simStarted=true; lastStepTime=now;
-                doInitialPlan(paths,maxLen,goal); pathsReady=true;
-            }
-            if(simStarted&&pathsReady&&lastReplanStep!=step){
-                if(lookaheadBlocked(step,paths,true)){
-                    replanAll(step,goal,paths,maxLen,true);
-                    lastReplanStep=step; replanFlash=true; replanFlashTime=now;
-                    lastStepTime=now;
+                // Console log
+                if(step!=lp){
+                    printf("Step %d:",step);
+                    for(int r=0;r<ROBOTS;r++){
+                        int t=min(step,(int)paths[r].size()-1);
+                        printf("  R%d@(%d,%d)%s",r,paths[r][t].first,paths[r][t].second,
+                               (paths[r][t]==cg[r])?"[G]":"");
+                    }
+                    printf("\n"); lp=step;
                 }
-            }
-            if(simStarted&&pathsReady&&now-lastStepTime>=TIME_PER_STEP)
-                if(step<maxLen-1){ step++; lastStepTime=now; }
-            if(simStarted&&pathsReady&&step!=lastPrinted){
-                printSingleStep(step,paths,goal); lastPrinted=step;
-            }
-
-            // ── relocation (FIX: always triggers, even when all at goals) ────
-            if(allObsPlaced && simStarted && pathsReady && !obstacles.empty()
-               && now-relocTriggerTime >= RELOC_INTERVAL){
-                if(allAtGoals(step,paths,goal)){
-                    // Robots already done — still count as a relocation cycle
-                    // so obstacles continue moving after the task completes.
-                    printf("[RELOC] All at goals — still relocating for continuous demo\n");
-                    tryRelocObs(ROWS,COLS,relocCount,obstacles,isProtected,isRobotHere,
-                                step,lastReplanStep,paths,maxLen,goal,now,
-                                replanFlash,replanFlashTime,lastStepTime,relocTriggerTime);
-                } else {
-                    tryRelocObs(ROWS,COLS,relocCount,obstacles,isProtected,isRobotHere,
-                                step,lastReplanStep,paths,maxLen,goal,now,
-                                replanFlash,replanFlashTime,lastStepTime,relocTriggerTime);
+                // Advance step fraction
+                stepFrac+=dt*(1.f/(float)TPS);
+                if(stepFrac>=1.f&&step<maxLen-1){
+                    step++; stepFrac=0.f;
+                    for(int r=0;r<ROBOTS;r++){
+                        int t=min(step,(int)paths[r].size()-1);
+                        robots[r].trackStep(step,paths[r][t]);
+                    }
+                }
+                if(stepFrac>1.f) stepFrac=1.f;
+                if(!finalPrinted&&allAtGoals(step,paths,cg)){
+                    printRethink(robots); finalPrinted=true;
                 }
             }
 
-            BeginDrawing(); ClearBackground(RAYWHITE);
+            // ==================== RENDER ====================
+            BeginDrawing();
+            ClearBackground(RAYWHITE);
             for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++){
                 if(grid[i][j]) DrawRectangle(j*CELL,i*CELL,CELL,CELL,DARKGRAY);
-                DrawRectangleLines(j*CELL,i*CELL,CELL,CELL,LIGHTGRAY);}
+                DrawRectangleLines(j*CELL,i*CELL,CELL,CELL,LIGHTGRAY);
+            }
             for(int r=0;r<ROBOTS;r++){
                 Color gc=colors[r]; gc.a=60;
-                DrawRectangle(goal[r].second*CELL+2,goal[r].first*CELL+2,CELL-4,CELL-4,gc);
-                DrawText(("G"+to_string(r)).c_str(),goal[r].second*CELL+4,goal[r].first*CELL+4,14,colors[r]);}
+                DrawRectangle(cg[r].second*CELL+2,cg[r].first*CELL+2,CELL-4,CELL-4,gc);
+                DrawText(("G"+to_string(r)).c_str(),cg[r].second*CELL+4,cg[r].first*CELL+4,13,colors[r]);
+            }
             for(int r=0;r<ROBOTS;r++){
-                int  s2=(simStarted&&pathsReady)?step:0;
-                int  ml=(simStarted&&pathsReady)?maxLen:1;
-                auto cur=(simStarted&&pathsReady)?paths[r][s2]:start[r];
-                auto nxt=(simStarted&&pathsReady)?paths[r][min(s2+1,ml-1)]:start[r];
-                float cx=cur.second*CELL+CELL/2.f,cy=cur.first*CELL+CELL/2.f;
-                float nx2=nxt.second*CELL+CELL/2.f,ny2=nxt.first*CELL+CELL/2.f;
-                float alpha=(simStarted&&pathsReady)?min(1.f,float((now-lastStepTime)/TIME_PER_STEP)):0.f;
-                posX[r]=cx+(nx2-cx)*alpha; posY[r]=cy+(ny2-cy)*alpha;
-                if(nxt.first>cur.first) angle[r]=90;
-                else if(nxt.first<cur.first) angle[r]=270;
-                else if(nxt.second>cur.second) angle[r]=0;
-                else if(nxt.second<cur.second) angle[r]=180;
-                renderRobot(r,posX[r],posY[r],angle[r],cur,goal[r],paths[r],colors[r]);}
-            DrawRectangle(0,ROWS*CELL,COLS*CELL,40,Fade(BLACK,0.75f));
-            if(!simStarted){
-                DrawText(("Mode2|Start in "+to_string(max(0,(int)(START_DELAY-(now-wallStart))+1))+"s").c_str(),10,ROWS*CELL+10,18,WHITE);
-            }else{
-                bool allDone=allAtGoals(step,paths,goal);
-                if(allDone) DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
+                if(!started||!ready){
+                    robots[r].px=(float)(startPos[r].second*CELL+CELL/2);
+                    robots[r].py=(float)(startPos[r].first *CELL+CELL/2);
+                    robots[r].angle=0.f;
+                    renderRobot(r,robots[r].px,robots[r].py,robots[r].angle,
+                                startPos[r],cg[r],{startPos[r]},robots[r],colors[r]);
+                    continue;
+                }
+                robots[r].updateSmooth(step,paths[r],stepFrac,dt);
+                int curIdx=min(step,(int)paths[r].size()-1);
+                renderRobot(r,robots[r].px,robots[r].py,robots[r].angle,
+                            paths[r][curIdx],cg[r],paths[r],robots[r],colors[r]);
+            }
+            DrawRectangle(0,ROWS*CELL,COLS*CELL,60,Fade(BLACK,0.80f));
+            if(!started){
+                int cd=(int)(SIM_START_DELAY-(now-wallStart))+1;
+                DrawText(("Mode "+to_string(modeLabel)+" | Obs="+to_string(n)+
+                    " | Start in "+to_string(max(0,cd))+"s").c_str(),
+                    6,ROWS*CELL+6,15,WHITE);
+            } else {
+                bool done=allAtGoals(step,paths,cg);
+                if(done) DrawText("ALL AT GOALS — see console",6,ROWS*CELL+6,15,GREEN);
                 else{
-                    string msg=allObsPlaced
-                        ?("Step "+to_string(step)+"/"+to_string(maxLen-1)+" | Relocs:"+to_string(relocCount))
-                        :("Placing obs "+to_string(obsPlaced)+"/"+to_string(n));
-                    DrawText(msg.c_str(),10,ROWS*CELL+10,18,WHITE);
-                    if(replanFlash&&now-replanFlashTime<1.0) DrawText("REPLAN",400,ROWS*CELL+10,18,YELLOW);
+                    string msg="Step "+to_string(step)+"/"+to_string(maxLen-1)
+                              +" | Obs:"+to_string(obsPlaced)+"/"+to_string(n)
+                              +" | Relocs:"+to_string(rc);
+                    DrawText(msg.c_str(),6,ROWS*CELL+6,15,WHITE);
+                    if(replanFlash&&now-replanFlashT<1.0) DrawText("REPLAN",340,ROWS*CELL+6,15,YELLOW);
                     else replanFlash=false;
-                }}
+                }
+                for(int r=0;r<ROBOTS;r++){
+                    float sx=4.f+r*(COLS*CELL/(float)ROBOTS);
+                    DrawText((to_string(r)+":"+string(decisionName(robots[r].lastDecision))
+                             +" W"+to_string(robots[r].waitCount)
+                             +" D"+to_string(robots[r].deviationCells)).c_str(),
+                             (int)sx,ROWS*CELL+34,10,colors[r]);
+                }
+            }
             EndDrawing();
         }
-        CloseWindow(); return 0;
-    }
+    }; // end runSim
 
-    // ── MODE 3 ──────────────────────────────────────────────────────────────
-    if(mode==3){
-        vector<pair<int,int>> rowGoalPool={{5,1},{5,2},{5,3},{5,4}};
-        vector<pair<int,int>> colGoalPool={{1,5},{2,5},{3,5},{4,5}};
-        std::random_device rd; std::mt19937 rng(rd());
-        shuffle(rowGoalPool.begin(),rowGoalPool.end(),rng);
-        shuffle(colGoalPool.begin(),colGoalPool.end(),rng);
-        goal.clear();
-        for(int i=0;i<4;i++) goal.push_back(rowGoalPool[i]);
-        for(int i=0;i<4;i++) goal.push_back(colGoalPool[i]);
-        printf("\n=== MODE 3 : Random Goals + Dynamic ===\n");
+    if(modeInput==1){
+        runSim(goalPos,1);
+    } else {
+        vector<pair<int,int>> rp={{5,1},{5,2},{5,3},{5,4}};
+        vector<pair<int,int>> cp2={{1,5},{2,5},{3,5},{4,5}};
+        mt19937 rng((unsigned)time(nullptr));
+        shuffle(rp.begin(),rp.end(),rng);
+        shuffle(cp2.begin(),cp2.end(),rng);
+        vector<pair<int,int>> rgoal;
+        for(int i=0;i<4;i++) rgoal.push_back(rp[i]);
+        for(int i=0;i<4;i++) rgoal.push_back(cp2[i]);
+        {
+            set<pair<int,int>> ug(rgoal.begin(),rgoal.end());
+            assert((int)ug.size()==ROBOTS&&"Mode 2: duplicate goal");
+        }
+        printf("\n=== MODE 2 : Random Goals ===\n");
         for(int r=0;r<ROBOTS;r++)
             printf(" %s: (%d,%d)->(%d,%d)\n",ROBOT_NAMES[r],
-                   start[r].first,start[r].second,goal[r].first,goal[r].second);
-
-        // Same timing fixes as mode 2
-        const float TIME_PER_STEP  = 1.5f;
-        const double START_DELAY   = 5.0;
-        const double OBS_INTERVAL  = 12.0;   // was 5.0
-        const double RELOC_INTERVAL= 10.0;   // was 8.0
-
-        double wallStart=GetTime();
-        int obsPlaced=0; double lastObsTime=wallStart; bool allObsPlaced=false;
-        bool simStarted=false; double lastStepTime=0.0;
-        int step=0,maxLen=1; bool pathsReady=false;
-        double relocTriggerTime=0.0; int relocCount=0;
-        vector<vector<pair<int,int>>> paths(ROBOTS);
-        vector<float> angle(ROBOTS,0),posX(ROBOTS),posY(ROBOTS);
-        for(int i=0;i<ROBOTS;i++){
-            posX[i]=start[i].second*CELL+CELL/2.f;
-            posY[i]=start[i].first*CELL+CELL/2.f;
-        }
-        bool replanFlash=false; double replanFlashTime=0.0;
-        int lastPrinted=-1,lastReplanStep=-1;
-
-        auto isProtected = [&](int x,int y){ return isProtectedStatic(x,y); };
-        auto isRobotHere = [&](int x,int y){ return isRobotAt(x,y,step,paths,simStarted); };
-
-        while(!WindowShouldClose()){
-            double now=GetTime();
-
-            if(!allObsPlaced && now-lastObsTime >= OBS_INTERVAL){
-                tryPlaceObs(ROWS,COLS,obsPlaced,obstacles,isProtected,isRobotHere,
-                            step,simStarted,pathsReady,lastReplanStep,
-                            paths,maxLen,goal,now,lastObsTime,
-                            replanFlash,replanFlashTime,lastStepTime);
-                if(obsPlaced>=n){ allObsPlaced=true; relocTriggerTime=now; }
-            }
-
-            if(!simStarted&&now-wallStart>=START_DELAY){
-                simStarted=true; lastStepTime=now;
-                doInitialPlan(paths,maxLen,goal); pathsReady=true;
-            }
-            if(simStarted&&pathsReady&&lastReplanStep!=step){
-                if(lookaheadBlocked(step,paths,true)){
-                    replanAll(step,goal,paths,maxLen,true);
-                    lastReplanStep=step; replanFlash=true; replanFlashTime=now;
-                    lastStepTime=now;
-                }
-            }
-            if(simStarted&&pathsReady&&now-lastStepTime>=TIME_PER_STEP)
-                if(step<maxLen-1){ step++; lastStepTime=now; }
-            if(simStarted&&pathsReady&&step!=lastPrinted){
-                printSingleStep(step,paths,goal); lastPrinted=step;
-            }
-
-            if(allObsPlaced && simStarted && pathsReady && !obstacles.empty()
-               && now-relocTriggerTime >= RELOC_INTERVAL){
-                tryRelocObs(ROWS,COLS,relocCount,obstacles,isProtected,isRobotHere,
-                            step,lastReplanStep,paths,maxLen,goal,now,
-                            replanFlash,replanFlashTime,lastStepTime,relocTriggerTime);
-            }
-
-            BeginDrawing(); ClearBackground(RAYWHITE);
-            for(int i=0;i<ROWS;i++) for(int j=0;j<COLS;j++){
-                if(grid[i][j]) DrawRectangle(j*CELL,i*CELL,CELL,CELL,DARKGRAY);
-                DrawRectangleLines(j*CELL,i*CELL,CELL,CELL,LIGHTGRAY);}
-            for(int r=0;r<ROBOTS;r++){
-                Color gc=colors[r]; gc.a=60;
-                DrawRectangle(goal[r].second*CELL+2,goal[r].first*CELL+2,CELL-4,CELL-4,gc);
-                DrawText(("G"+to_string(r)).c_str(),goal[r].second*CELL+4,goal[r].first*CELL+4,14,colors[r]);}
-            for(int r=0;r<ROBOTS;r++){
-                int  s2=(simStarted&&pathsReady)?step:0;
-                int  ml=(simStarted&&pathsReady)?maxLen:1;
-                auto cur=(simStarted&&pathsReady)?paths[r][s2]:start[r];
-                auto nxt=(simStarted&&pathsReady)?paths[r][min(s2+1,ml-1)]:start[r];
-                float cx=cur.second*CELL+CELL/2.f,cy=cur.first*CELL+CELL/2.f;
-                float nx2=nxt.second*CELL+CELL/2.f,ny2=nxt.first*CELL+CELL/2.f;
-                float alpha=(simStarted&&pathsReady)?min(1.f,float((now-lastStepTime)/TIME_PER_STEP)):0.f;
-                posX[r]=cx+(nx2-cx)*alpha; posY[r]=cy+(ny2-cy)*alpha;
-                if(nxt.first>cur.first) angle[r]=90;
-                else if(nxt.first<cur.first) angle[r]=270;
-                else if(nxt.second>cur.second) angle[r]=0;
-                else if(nxt.second<cur.second) angle[r]=180;
-                renderRobot(r,posX[r],posY[r],angle[r],cur,goal[r],paths[r],colors[r]);}
-            DrawRectangle(0,ROWS*CELL,COLS*CELL,40,Fade(BLACK,0.75f));
-            if(!simStarted){
-                DrawText(("Mode3|Start in "+to_string(max(0,(int)(START_DELAY-(now-wallStart))+1))+"s").c_str(),10,ROWS*CELL+10,18,WHITE);
-            }else{
-                bool allDone=allAtGoals(step,paths,goal);
-                if(allDone) DrawText("All at goals!",10,ROWS*CELL+10,18,GREEN);
-                else{
-                    string msg=allObsPlaced
-                        ?("Step "+to_string(step)+"/"+to_string(maxLen-1)+" | Relocs:"+to_string(relocCount))
-                        :("Placing obs "+to_string(obsPlaced)+"/"+to_string(n));
-                    DrawText(msg.c_str(),10,ROWS*CELL+10,18,WHITE);
-                    if(replanFlash&&now-replanFlashTime<1.0) DrawText("REPLAN",400,ROWS*CELL+10,18,YELLOW);
-                    else replanFlash=false;
-                }}
-            EndDrawing();
-        }
-        CloseWindow(); return 0;
+                   startPos[r].first,startPos[r].second,
+                   rgoal[r].first,rgoal[r].second);
+        runSim(rgoal,2);
     }
-
-    CloseWindow(); return 0;
+    CloseWindow();
+    return 0;
 }
